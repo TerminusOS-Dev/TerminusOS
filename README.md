@@ -78,4 +78,4 @@ Nano got rebuilt again since 0.4.3, on every axis:
 ## 👨‍💻 Author
 
 - **YouTube:** [Zero Logic](https://www.youtube.com/@Zero-Logic-dev)
-- **Telegram:** [@den2010991](https://telegram.me/den2010991)
+- **Telegram:** [@Terminus_dev](https://telegram.me/Terminus_dev)
