@@ -1,4 +1,4 @@
-// ─── Multiboot Header ─────────────────────────────────────────────────────────
+// Multiboot Header 
 .intel_syntax noprefix
 
 .section .multiboot
@@ -12,7 +12,7 @@
 .long 480
 .long 32
 
-// ─── Entry Point ──────────────────────────────────────────────────────────────
+// Entry Point
 .global _start
 .section .text
 _start:

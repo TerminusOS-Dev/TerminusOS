@@ -7,6 +7,8 @@
 #include "builtin.h"
 #include "../lib/scrollback.h"
 #include "../commands/cmd_registry.h"
+#include "../kernel/keyboard.h"
+#include "../lib/clipboard.h"
 
 // Нужные символы из disk.h — объявляем вручную чтобы не тянуть конфликтующий disk.h
 extern uint8_t sector_buffer[512];
@@ -30,6 +32,28 @@ static char  last_executed_command[BUF_SIZE] = {0};
 static char  time_string[16] = "--:--:--";
 static bool  status_bar_dirty = true;
 static int   prompt_start_row = 1;   // строка экрана, с которой начинается текущий промпт
+
+// ─── Выделение в строке ввода ────────────────────────────────────────────────
+// sel_anchor — позиция в buffer, где начали выделять (-1 = выделения нет);
+// второй конец выделения — cursor_offset. Выделен диапазон [min, max).
+static int sel_anchor = -1;
+static bool sel_range(int* a, int* b) {
+    if (sel_anchor < 0 || sel_anchor > buf_len || sel_anchor == cursor_offset) return false;
+    if (sel_anchor < cursor_offset) { *a = sel_anchor;    *b = cursor_offset; }
+    else                            { *a = cursor_offset; *b = sel_anchor;    }
+    return true;
+}
+// Удаляет выделенный текст из buffer (без перерисовки). true — если что-то удалили.
+static bool sel_delete() {
+    int a, b;
+    if (!sel_range(&a, &b)) { sel_anchor = -1; return false; }
+    for (int i = b; i <= buf_len; i++) buffer[a + (i - b)] = buffer[i];
+    buf_len -= (b - a);
+    buffer[buf_len] = 0;
+    cursor_offset = a;
+    sel_anchor = -1;
+    return true;
+}
 
 // ─── Scrollback view ─────────────────────────────────────────────────────────
 // view_bottom: индекс scrollback-строки, которая отображается в НИЖНЕЙ строке экрана.
@@ -273,6 +297,23 @@ void shell_redraw() {
 
     int prompt_len = strlen(current_path) + 2;
 
+    // Подсветка выделения: инвертируем атрибут выделенных символов
+    {
+        int sa, sb;
+        if (sel_range(&sa, &sb)) {
+            uint8_t a   = get_theme_color();
+            uint8_t inv = (uint8_t)(((a & 0x0F) << 4) | (a >> 4));
+            for (int i = sa; i < sb; i++) {
+                int abs = prompt_len + i;
+                int row = prompt_start_row + abs / 80;
+                int col = abs % 80;
+                if (row >= 25) break;
+                uint16_t cell = video_memory[row * 80 + col];
+                video_memory[row * 80 + col] = (uint16_t)(((uint16_t)inv << 8) | (cell & 0x00FF));
+            }
+        }
+    }
+
     // Позиция курсора с учётом wrapping
     int abs_offset = prompt_len + cursor_offset;
     int cursor_row = prompt_start_row + abs_offset / 80;
@@ -301,6 +342,7 @@ void shell_redraw() {
 }
 
 void shell_insert_char(char c) {
+    sel_delete();                       // набор поверх выделения заменяет его
     if (buf_len >= BUF_SIZE - 1) return;
     tab_reset();
     for (int i = buf_len; i > cursor_offset; i--) buffer[i] = buffer[i-1];
@@ -312,6 +354,7 @@ void shell_insert_char(char c) {
 }
 
 void shell_delete_char() {
+    if (sel_delete()) { tab_reset(); shell_redraw(); return; }
     if (cursor_offset == 0) return;
     tab_reset();
     for (int i = cursor_offset - 1; i < buf_len; i++) buffer[i] = buffer[i+1];
@@ -319,6 +362,285 @@ void shell_delete_char() {
     cursor_offset--;
     buffer[buf_len] = 0;
     shell_redraw();
+}
+
+// ─── Панель истории буфера обмена (Win+V) ────────────────────────────────────
+// Небольшое окошко внизу справа: список последних скопированных фрагментов.
+//   Вверх/Вниз — выбор, Enter — вставить в текущую строку ввода, Esc — закрыть.
+//   Влево на записи — взвести удаление (метка "d"), Enter в этом состоянии —
+//   удалить именно эту запись. Последний пункт — "Clear all", но там Enter
+//   без Ctrl игнорируется — только Ctrl+Enter реально чистит всю историю.
+// Перевод строки/табы в записи показываем одним символом, иначе VGA рисует кракозябры.
+static char clip_vis(char ch) {
+    if (ch == '\n') return (char)0x14;            // ¶
+    if ((unsigned char)ch < 32) return ' ';
+    return ch;
+}
+
+// Само окошко: возвращает индекс выбранной записи (0 = самая новая) или -1,
+// если пользователь закрыл окно / удалил запись / очистил всё. Экран под окошком
+// восстанавливается, но строку ввода не перерисовывает — это делает вызывающий
+// (шелл — shell_redraw, nano — editor_redraw). Нужен и шеллу, и nano.
+int shell_clipboard_pick() {
+    int  result = -1;
+    int  sel = 0;
+    bool del_armed = false;
+    bool dirty = true;
+    bool open = true;
+
+    const uint8_t frame_attr = (uint8_t)((theme_bar_bg << 4) | theme_bar_fg);
+    const uint8_t item_attr  = get_theme_color();
+    const uint8_t sel_attr   = (uint8_t)((theme_fg << 4) | theme_bg); // инверсия темы
+    const uint8_t warn_attr  = (uint8_t)((theme_bar_bg << 4) | VGA_COLOR_LIGHT_RED);
+
+    int n = clipboard_count();
+    int pw = 30;
+    int ph = (n > 0 ? n + 1 : 1) + 2; // +1 = пункт "Clear all"
+    int px = 80 - pw - 1;
+    int py = 25 - ph - 1;
+    if (py < 1) py = 1; // не залезаем на статус-бар (строка 0)
+
+    static uint16_t backup[30 * 20];
+    for (int r = 0; r < ph; r++)
+        for (int c = 0; c < pw; c++)
+            backup[r * pw + c] = video_memory[(py + r) * 80 + (px + c)];
+
+    while (open) {
+        n = clipboard_count(); // могло измениться после удаления
+        if (dirty) {
+            for (int r = 0; r < ph; r++)
+                for (int c = 0; c < pw; c++)
+                    video_memory[(py + r) * 80 + (px + c)] = ((uint16_t)frame_attr << 8) | ' ';
+            for (int c = 0; c < pw; c++) {
+                video_memory[py * 80 + (px + c)] = ((uint16_t)frame_attr << 8) | '-';
+                video_memory[(py + ph - 1) * 80 + (px + c)] = ((uint16_t)frame_attr << 8) | '-';
+            }
+            for (int r = 0; r < ph; r++) {
+                video_memory[(py + r) * 80 + px] = ((uint16_t)frame_attr << 8) | '|';
+                video_memory[(py + r) * 80 + (px + pw - 1)] = ((uint16_t)frame_attr << 8) | '|';
+            }
+            const char* title = " Clipboard ";
+            for (int i = 0; title[i] && i < pw - 2; i++)
+                video_memory[py * 80 + (px + 2 + i)] = ((uint16_t)frame_attr << 8) | title[i];
+
+            if (n == 0) {
+                const char* msg = "(empty)";
+                for (int i = 0; msg[i] && i < pw - 2; i++)
+                    video_memory[(py + 1) * 80 + (px + 1 + i)] = ((uint16_t)item_attr << 8) | msg[i];
+            } else {
+                for (int i = 0; i < n; i++) {
+                    bool armed = (i == sel && del_armed);
+                    uint8_t rowattr = armed ? warn_attr : (i == sel ? sel_attr : item_attr);
+                    const char* txt = clipboard_get(i);
+                    for (int c = 1; c < pw - 1; c++)
+                        video_memory[(py + 1 + i) * 80 + (px + c)] = ((uint16_t)rowattr << 8) | ' ';
+                    int off = 1;
+                    if (armed) { video_memory[(py + 1 + i) * 80 + (px + 1)] = ((uint16_t)rowattr << 8) | 'd'; off = 2; }
+                    for (int c = 0; txt[c] && c < pw - 1 - off; c++)
+                        video_memory[(py + 1 + i) * 80 + (px + off + c)] = ((uint16_t)rowattr << 8) | (uint8_t)clip_vis(txt[c]);
+                }
+                // "Clear all" — последняя строка списка
+                int cr = n;
+                uint8_t crattr = (sel == n) ? sel_attr : item_attr;
+                const char* ctxt = "Clear all (Ctrl+Enter)";
+                for (int c = 1; c < pw - 1; c++)
+                    video_memory[(py + 1 + cr) * 80 + (px + c)] = ((uint16_t)crattr << 8) | ' ';
+                for (int i = 0; ctxt[i] && i < pw - 2; i++)
+                    video_memory[(py + 1 + cr) * 80 + (px + 1 + i)] = ((uint16_t)crattr << 8) | ctxt[i];
+            }
+            dirty = false;
+        }
+
+        uint8_t key = get_key();
+        if (key == 0) continue;
+        int last_sel = n > 0 ? n : 0; // индекс строки "Clear all" (только если есть записи)
+        if (key == CHAR_ARROW_UP) { if (sel > 0) { sel--; del_armed = false; dirty = true; } }
+        else if (key == CHAR_ARROW_DOWN) { if (sel < last_sel) { sel++; del_armed = false; dirty = true; } }
+        else if (key == CHAR_ARROW_LEFT) { if (n > 0 && sel < n) { del_armed = !del_armed; dirty = true; } }
+        else if (key == CHAR_ARROW_RIGHT) { if (del_armed) { del_armed = false; dirty = true; } }
+        else if (key == 27) { open = false; }
+        else if (key == CHAR_CTRL_ENTER) {
+            if (n > 0 && sel == n) { clipboard_clear(); open = false; }
+        }
+        else if (key == '\n') {
+            if (n > 0 && sel == n) { /* Clear all без Ctrl — игнорируем */ }
+            else if (n > 0 && del_armed) { clipboard_delete(sel); if (sel > 0) sel--; del_armed = false; dirty = true; }
+            else if (n > 0) { result = sel; open = false; }
+        }
+    }
+
+    for (int r = 0; r < ph; r++)
+        for (int c = 0; c < pw; c++)
+            video_memory[(py + r) * 80 + (px + c)] = backup[r * pw + c];
+    return result;
+}
+
+// Win+V в шелле: выбрать запись из истории и вставить её в строку ввода.
+void shell_clipboard_popup() {
+    int idx = shell_clipboard_pick();
+    if (idx >= 0) shell_paste_text(clipboard_get(idx));
+    else          shell_redraw();
+}
+
+static bool sh_is_ident(char c){
+    return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';
+}
+static int word_left_pos(int c){
+    if(c==0) return 0;
+    c--;
+    while(c>0 && buffer[c]==' ') c--;
+    if(sh_is_ident(buffer[c])){ while(c>0 && sh_is_ident(buffer[c-1])) c--; }
+    else { while(c>0 && buffer[c-1]!=' ' && !sh_is_ident(buffer[c-1])) c--; }
+    return c;
+}
+static int word_right_pos(int c){
+    if(c>=buf_len) return c;
+    while(c<buf_len && buffer[c]==' ') c++;
+    if(c<buf_len && sh_is_ident(buffer[c])){ while(c<buf_len && sh_is_ident(buffer[c])) c++; }
+    else { while(c<buf_len && buffer[c]!=' ' && !sh_is_ident(buffer[c])) c++; }
+    return c;
+}
+void shell_word_left(){
+    bool had = (sel_anchor >= 0);
+    sel_anchor = -1;
+    int c = word_left_pos(cursor_offset);
+    if(c==cursor_offset && !had) return;
+    cursor_offset=c;
+    shell_redraw();
+}
+void shell_word_right(){
+    bool had = (sel_anchor >= 0);
+    sel_anchor = -1;
+    int c = word_right_pos(cursor_offset);
+    if(c==cursor_offset && !had) return;
+    cursor_offset=c;
+    shell_redraw();
+}
+void shell_delete_word_left(){
+    if (sel_delete()) { tab_reset(); shell_redraw(); return; }
+    if(cursor_offset==0) return;
+    tab_reset();
+    int old=cursor_offset;
+    int c=old-1;
+    while(c>0 && buffer[c]==' ') c--;
+    if(sh_is_ident(buffer[c])){ while(c>0 && sh_is_ident(buffer[c-1])) c--; }
+    else { while(c>0 && buffer[c-1]!=' ' && !sh_is_ident(buffer[c-1])) c--; }
+    int nw=c;
+    for(int i=0;i<=buf_len-old;i++) buffer[nw+i]=buffer[old+i];
+    buf_len -= (old-nw);
+    cursor_offset=nw;
+    shell_redraw();
+}
+
+// ─── Выделение, копирование, вырезание, вставка ──────────────────────────────
+// Все копирования идут в общую историю (clipboard.h) — её же видят nano и gite.
+
+void shell_sel_clear() { sel_anchor = -1; }
+
+// Обычная стрелка при выделении: схлопывает его к краю, как в редакторах.
+bool shell_sel_collapse(bool to_end) {
+    int a, b;
+    if (!sel_range(&a, &b)) { sel_anchor = -1; return false; }
+    cursor_offset = to_end ? b : a;
+    sel_anchor = -1;
+    shell_redraw();
+    return true;
+}
+
+// Shift+←/→ (kind 0/1) и Ctrl+Shift+←/→ (kind 2/3): расширить выделение.
+void shell_select_extend(int kind) {
+    int np = cursor_offset;
+    if      (kind == 0) { if (np > 0)       np--; }
+    else if (kind == 1) { if (np < buf_len) np++; }
+    else if (kind == 2) np = word_left_pos(np);
+    else                np = word_right_pos(np);
+    if (np == cursor_offset) return;
+    if (sel_anchor < 0) sel_anchor = cursor_offset;
+    cursor_offset = np;
+    shell_redraw();
+}
+
+// Ctrl+Shift+A: выделить всю строку ввода (Ctrl+A в шелле — Home, как в bash).
+void shell_select_all() {
+    if (buf_len == 0) return;
+    sel_anchor = 0;
+    cursor_offset = buf_len;
+    shell_redraw();
+}
+
+// Кладёт выделенный фрагмент в историю буфера обмена.
+static bool sel_push() {
+    int a, b;
+    if (!sel_range(&a, &b)) return false;
+    char tmp[BUF_SIZE];
+    int n = 0;
+    for (int i = a; i < b && n < BUF_SIZE - 1; i++) tmp[n++] = buffer[i];
+    tmp[n] = 0;
+    clipboard_push(tmp);
+    return true;
+}
+
+// Ctrl+C. false — выделения нет (тогда Ctrl+C работает как раньше: отмена строки).
+bool shell_copy_selection() {
+    if (!sel_push()) return false;
+    sel_anchor = -1;
+    shell_redraw();
+    return true;
+}
+
+// Ctrl+X. false — выделения нет, ничего не произошло.
+bool shell_cut_selection() {
+    if (!sel_push()) return false;
+    sel_delete();
+    tab_reset();
+    shell_redraw();
+    return true;
+}
+
+// Ctrl+K: скопировать всю строку ввода целиком (как в nano — копирование строки).
+void shell_copy_line() {
+    if (buf_len == 0) return;
+    buffer[buf_len] = 0;
+    clipboard_push(buffer);
+}
+
+// Вставка в позицию курсора (заменяя выделение). Строка ввода однострочная, поэтому
+// переводы строк и табы превращаются в пробелы, хвостовые переводы строк
+// отбрасываются, непечатные символы пропускаются.
+void shell_paste_text(const char* txt) {
+    if (!txt) return;
+    int len = strlen(txt);
+    while (len > 0 && (txt[len - 1] == '\n' || txt[len - 1] == '\r')) len--;
+    if (len == 0) return;
+    sel_delete();
+    tab_reset();
+    for (int i = 0; i < len && buf_len < BUF_SIZE - 1; i++) {
+        char c = txt[i];
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        if (c < 32 || (unsigned char)c >= 128) continue;
+        for (int k = buf_len; k > cursor_offset; k--) buffer[k] = buffer[k - 1];
+        buffer[cursor_offset] = c;
+        buf_len++;
+        cursor_offset++;
+        buffer[buf_len] = 0;
+    }
+    shell_redraw();
+}
+
+// Ctrl+V: вставить самую свежую запись истории.
+void shell_paste_latest() {
+    if (clipboard_count() > 0) shell_paste_text(clipboard_get(0));
+}
+
+// Delete: удаляет выделение или символ под курсором.
+void shell_delete_forward() {
+    if (sel_delete()) { tab_reset(); shell_redraw(); return; }
+    if (cursor_offset < buf_len) {
+        for (int i = cursor_offset; i < buf_len; i++) buffer[i] = buffer[i + 1];
+        buf_len--;
+        buffer[buf_len] = 0;
+        shell_redraw();
+    }
 }
 
 void shell_add_to_history(const char* cmd) {
@@ -330,6 +652,7 @@ void shell_add_to_history(const char* cmd) {
 }
 
 void shell_load_history(int index) {
+    sel_anchor = -1;
     if (index < 0) {
         for (int i = 0; i < BUF_SIZE; i++) buffer[i] = 0;
         buf_len = 0;
@@ -427,6 +750,7 @@ static void get_last_word(char* out, int* start_out) {
 }
 
 void shell_handle_tab(bool reverse) {
+    sel_anchor = -1;
     // Цикл по уже найденным совпадениям
     if (tab_match_count > 0) {
         if (!reverse) tab_match_index = (tab_match_index + 1) % tab_match_count;
@@ -462,7 +786,8 @@ void shell_handle_tab(bool reverse) {
         bool allow_file = false;
         for (int i = 0; i < CMD_TABLE_SIZE; i++) {
             if (strcmp(cmd, CMD_TABLE[i].name) == 0) {
-                allow_file = (CMD_TABLE[i].arg_type == ARG_FILE);
+                allow_file = (CMD_TABLE[i].arg_type == ARG_FILE) ||
+                             (strcmp(cmd, "gite") == 0); // необязательный, но всё равно путь к файлу
                 break;
             }
         }
@@ -550,6 +875,7 @@ void shell_redraw_full() {
 }
 
 void shell_clear_buffer() {
+    sel_anchor = -1;
     for (int i = 0; i < BUF_SIZE; i++) buffer[i] = 0;
     buf_len = 0;
     cursor_offset = 0;
@@ -558,6 +884,7 @@ void shell_clear_buffer() {
 // ─── Команды ─────────────────────────────────────────────────────────────────
 
 void process_command() {
+    sel_anchor = -1;
     buffer[buf_len] = 0;
 
     // ── !N — выполнить команду №N из истории ──────────────────────────────

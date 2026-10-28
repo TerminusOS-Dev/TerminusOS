@@ -72,4 +72,21 @@ void shell_exit_scrollback();
 bool shell_is_in_scrollback();
 void shell_redraw_full();
 void shell_clear_buffer();
+void shell_clipboard_popup();
+void shell_word_left();
+void shell_word_right();
+void shell_delete_word_left();
+void shell_delete_forward();
+
+// Выделение / буфер обмена в строке ввода (общая история — lib/clipboard.h)
+void shell_sel_clear();
+bool shell_sel_collapse(bool to_end);   // стрелка при выделении: true — выделение было
+void shell_select_extend(int kind);     // 0=Shift+←  1=Shift+→  2=Ctrl+Shift+←  3=Ctrl+Shift+→
+void shell_select_all();
+bool shell_copy_selection();            // Ctrl+C (false — выделения нет)
+bool shell_cut_selection();             // Ctrl+X (false — выделения нет)
+void shell_copy_line();                 // Ctrl+K
+void shell_paste_text(const char* txt);
+void shell_paste_latest();              // Ctrl+V
+int  shell_clipboard_pick();            // окно истории: индекс записи или -1 (для nano)
 #endif

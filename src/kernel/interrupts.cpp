@@ -4,10 +4,42 @@
 #include "../drivers/disk.h" // Для inb, outb
 #include "../drivers/serial.h"
 #include "mouse.h"
+#include "keyboard.h"
+#include "elf_loader.h"
 
 // IDT
 idt_entry idt[256];
 idt_ptr idtp;
+
+// Global monotonic tick counter (IRQ0 / PIT). Starts at 0 after timer_init().
+volatile uint32_t g_ticks = 0;
+
+// ─── PIT (Programmable Interval Timer) ───────────────────────────────────────
+// Channel 0, mode 3 (square wave), divisor = 1193182 / TIMER_HZ.
+// Without this the BIOS leaves ~18.2 Hz; we want a known rate for time syscalls.
+void timer_init(void) {
+    const uint32_t divisor = 1193182u / (uint32_t)TIMER_HZ;
+    // Command: channel 0 | lobyte/hibyte | mode 3 | binary
+    outb(0x43, 0x36);
+    outb(0x40, (uint8_t)(divisor & 0xFF));
+    outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
+    g_ticks = 0;
+    serial_write("[TIMER] PIT ");
+    // tiny decimal dump of TIMER_HZ
+    {
+        char buf[8]; int i = 0; int hz = TIMER_HZ;
+        if (hz == 0) buf[i++] = '0';
+        else { char tmp[8]; int n = 0; while (hz) { tmp[n++] = '0' + (hz % 10); hz /= 10; }
+               while (n--) buf[i++] = tmp[n]; }
+        buf[i] = 0;
+        serial_write(buf);
+    }
+    serial_write(" Hz, ticks armed\n");
+}
+
+uint32_t timer_get_ticks(void) {
+    return g_ticks;
+}
 
 // Коды ошибок для исключений
 const char *exception_messages[] = {
@@ -81,6 +113,7 @@ void irq_remap() {
 
     // Включаем IRQ 1 (клавиатура), IRQ 12 (мышь) и IRQ 2 (cascade slave->master,
     // без этого IRQ8-15, в т.ч. IRQ12, до CPU не доходят вообще)
+    irq_clear_mask(0);  /* timer */
     irq_clear_mask(1);
     irq_clear_mask(12);
     irq_clear_mask(2);
@@ -168,8 +201,63 @@ extern "C" void irq_handler(registers regs) {
     outb(0x20, PIC_EOI); 
 
     switch (regs.int_no) {
+        case 32: { // IRQ 0: Timer (PIT)
+            g_ticks++;
+            // ВНИМАНИЕ: из-за отсутствия push %ds в общем ISR/IRQ asm-шаблоне
+            // (interrupts_asm.s) структура registers сдвинута на одно слово для
+            // ЛЮБОГО прерывания: regs.eip в реальности содержит CS, а настоящий
+            // EIP лежит в regs.err_code. Это отдельный баг за пределами текущей
+            // задачи — здесь просто читаем правильное поле, не трогая asm.
+            // Debug dump ~5 times/sec while an ELF is running (at TIMER_HZ=100).
+            if (g_elf_running && (g_ticks % 20) == 0) {
+                uint32_t real_eip = regs.err_code;
+                // Тот же "сдвиг на одно слово" (см. коммент выше) означает,
+                // что CS реально лежит в regs.eip, а EFLAGS — в regs.cs.
+                // Печатаем оба для перекрёстной проверки: CS должен всегда
+                // быть 0x00000008 (плоская модель, единое кольцо 0, ни
+                // одного far jump/call gate ни разу не происходит) — если
+                // тут что-то другое, значит наше предположение о сдвиге
+                // само неверное и eip читаем не оттуда.
+                uint32_t real_cs     = regs.eip;
+                uint32_t real_eflags = regs.cs;
+                serial_write("[tick eip=0x");
+                serial_hex8((uint8_t)(real_eip >> 24));
+                serial_hex8((uint8_t)(real_eip >> 16));
+                serial_hex8((uint8_t)(real_eip >> 8));
+                serial_hex8((uint8_t)(real_eip));
+                serial_write(" cs=0x");
+                serial_hex8((uint8_t)(real_cs >> 24));
+                serial_hex8((uint8_t)(real_cs >> 16));
+                serial_hex8((uint8_t)(real_cs >> 8));
+                serial_hex8((uint8_t)(real_cs));
+                serial_write(" eflags=0x");
+                serial_hex8((uint8_t)(real_eflags >> 24));
+                serial_hex8((uint8_t)(real_eflags >> 16));
+                serial_hex8((uint8_t)(real_eflags >> 8));
+                serial_hex8((uint8_t)(real_eflags));
+                serial_write("]\n");
+            }
+            break;
+        }
         case 33: // IRQ 1: Keyboard
-            // Аппаратный обработчик IRQ 1 позволяет считывать scancode в main loop.
+            // Always drain the PS/2 data port (keyboard_on_irq). Never call get_key()
+            // here — it used to pop the software queue first and leave the hardware
+            // byte unread → IRQ storm / freeze.
+            keyboard_on_irq();
+            if (g_elf_running) {
+                // Hard Ctrl+C: kill the ELF even if it never calls read().
+                // Inspect only the software queue (never the PS/2 data port from
+                // IRQ context); the first key is Ctrl+C iff the user pressed it.
+                uint8_t k = keyboard_check_ctrl_c();
+                if (k == CHAR_CTRL_C) {
+                    __asm__ volatile ("cli");
+                    serial_write("[IRQ1] Ctrl+C → kill ELF\n");
+                    // visual feedback
+                    print("^C\n");
+                    // 130 = 128 + SIGINT; never returns
+                    elf_request_exit(130);
+                }
+            }
             break;
         case 44: // IRQ 12: Mouse
             mouse_handle_packet();

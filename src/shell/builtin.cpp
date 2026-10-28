@@ -216,6 +216,28 @@ void cmd_rm(char* name) {
     current_dir_cluster = saved;
 }
 
+// Если dst_leaf указывает на СУЩЕСТВУЮЩУЮ директорию (внутри dst_dir) —
+// перенаправляем ВНУТРЬ неё, подставляя leaf_name как итоговое имя (обычное
+// поведение mv/cp в реальных ОС: "mv file /dir" кладёт file внутрь /dir, а не
+// переименовывает саму /dir). Если dst_leaf уже пустой ("mv src /dir/" —
+// путь оканчивался на "/") — leaf_name используется сразу, без проверки.
+// Было продублировано отдельно в cmd_mv и дважды в cmd_cp.
+static void resolve_move_destination(const char* leaf_name, uint32_t* dst_dir, char* dst_leaf) {
+    if (dst_leaf[0] == 0) {
+        int k = 0; while (leaf_name[k]) { dst_leaf[k] = leaf_name[k]; k++; } dst_leaf[k] = 0;
+        return;
+    }
+    uint32_t saved = current_dir_cluster;
+    current_dir_cluster = *dst_dir;
+    FAT32_FindResult r = fat32_find_entry(dst_leaf, 0x10);
+    current_dir_cluster = saved;
+    if (r.found && (r.entry.attributes & 0x10)) {
+        uint32_t tc = FAT32_GET_CLUSTER(&r.entry);
+        *dst_dir = (tc < 2) ? FAT32_ROOT_CLUSTER : tc;
+        int k = 0; while (leaf_name[k]) { dst_leaf[k] = leaf_name[k]; k++; } dst_leaf[k] = 0;
+    }
+}
+
 void cmd_mv(char* args) {
     char old_path[128]={0}, new_path[128]={0};
     int len = strlen(args), sp = 0;
@@ -240,22 +262,7 @@ void cmd_mv(char* args) {
         println("Error: Destination path not found."); return;
     }
 
-    if (dst_leaf[0] == 0) {
-        // "mv src /dir/" — переносим В /dir/ с тем же именем
-        int k = 0; while (src_leaf[k]) { dst_leaf[k] = src_leaf[k]; k++; } dst_leaf[k] = 0;
-    } else {
-        // Если назначение — уже существующая директория, переносим ВНУТРЬ неё
-        // с исходным именем (как обычный mv в реальных ОС), а не переименовываем саму папку
-        uint32_t saved = current_dir_cluster;
-        current_dir_cluster = dst_dir;
-        FAT32_FindResult r = fat32_find_entry(dst_leaf, 0x10);
-        current_dir_cluster = saved;
-        if (r.found && (r.entry.attributes & 0x10)) {
-            uint32_t tc = FAT32_GET_CLUSTER(&r.entry);
-            dst_dir = (tc < 2) ? FAT32_ROOT_CLUSTER : tc;
-            int k = 0; while (src_leaf[k]) { dst_leaf[k] = src_leaf[k]; k++; } dst_leaf[k] = 0;
-        }
-    }
+    resolve_move_destination(src_leaf, &dst_dir, dst_leaf);
 
     if (!fat32_move_entry(src_dir, src_leaf, dst_dir, dst_leaf)) {
         println("Error: Move failed (destination exists or no space).");
@@ -301,18 +308,7 @@ void cmd_cp(char* args) {
             println("Error: Destination path not found."); return;
         }
         uint32_t saved_cd = current_dir_cluster;
-        if (dst_leaf[0] == 0) {
-            int k = 0; while (iso_leaf[k]) { dst_leaf[k] = iso_leaf[k]; k++; } dst_leaf[k] = 0;
-        } else {
-            current_dir_cluster = dst_dir;
-            FAT32_FindResult dr = fat32_find_entry(dst_leaf, 0x10);
-            current_dir_cluster = saved_cd;
-            if (dr.found && (dr.entry.attributes & 0x10)) {
-                uint32_t tc = FAT32_GET_CLUSTER(&dr.entry);
-                dst_dir = (tc < 2) ? FAT32_ROOT_CLUSTER : tc;
-                int k = 0; while (iso_leaf[k]) { dst_leaf[k] = iso_leaf[k]; k++; } dst_leaf[k] = 0;
-            }
-        }
+        resolve_move_destination(iso_leaf, &dst_dir, dst_leaf);
 
         current_dir_cluster = dst_dir;
         bool dst_exists = fat32_find_entry(dst_leaf, 0x00).found;
@@ -341,36 +337,13 @@ void cmd_cp(char* args) {
     if (size > sizeof(cp_buffer)) { println("Error: File too large for buffer. Max: 1MB"); return; }
 
     uint32_t cluster = FAT32_GET_CLUSTER(&res.entry);
-    uint32_t bytes_read = 0;
-
-    while ((cluster & FAT32_MASK) >= 2 &&
-           (cluster & FAT32_MASK) < (FAT32_EOC & FAT32_MASK) &&
-           bytes_read < size) {
-        uint32_t lba = fat32_cluster_to_lba(cluster);
-        for (int s = 0; s < FAT32_SECTORS_PER_CLUSTER && bytes_read < size; s++) {
-            ata_read_sector(lba + s);
-            for (int b = 0; b < FAT32_BYTES_PER_SECTOR && bytes_read < size; b++)
-                cp_buffer[bytes_read++] = sector_buffer[b];
-        }
-        cluster = fat32_get_next_cluster(cluster);
-    }
+    uint32_t bytes_read = fat32_read_file_to_buffer(cluster, size, cp_buffer, sizeof(cp_buffer));
 
     char dst_leaf[128]; uint32_t dst_dir;
     if (!fat32_resolve_path(dst_path, &dst_dir, dst_leaf)) {
         println("Error: Destination path not found."); return;
     }
-    if (dst_leaf[0] == 0) {
-        int k = 0; while (src_leaf[k]) { dst_leaf[k] = src_leaf[k]; k++; } dst_leaf[k] = 0;
-    } else {
-        current_dir_cluster = dst_dir;
-        FAT32_FindResult r = fat32_find_entry(dst_leaf, 0x10);
-        current_dir_cluster = saved;
-        if (r.found && (r.entry.attributes & 0x10)) {
-            uint32_t tc = FAT32_GET_CLUSTER(&r.entry);
-            dst_dir = (tc < 2) ? FAT32_ROOT_CLUSTER : tc;
-            int k = 0; while (src_leaf[k]) { dst_leaf[k] = src_leaf[k]; k++; } dst_leaf[k] = 0;
-        }
-    }
+    resolve_move_destination(src_leaf, &dst_dir, dst_leaf);
 
     current_dir_cluster = dst_dir;
     bool dst_exists = fat32_find_entry(dst_leaf, 0x00).found;
@@ -426,41 +399,8 @@ void cmd_ls_disk() {
 
                 // LFN запись
                 if (e->attributes == 0x0F) {
-                    // Структура LFN: bytes 1-10 (5 UCS-2), 14-23 (6), 28-31 (2) = 13 символов
-                    // Берём только младший байт каждого UCS-2 символа
                     uint8_t* raw = (uint8_t*)e;
-                    // Определяем порядковый номер (бит 6 = последняя запись)
-                    uint8_t ord = raw[0] & 0x3F;
-                    // Для простоты накапливаем LFN в обратном порядке и потом переворачиваем
-                    // Но т.к. LFN-записи идут от последней к первой, просто читаем символы
-                    char chunk[13]; int ci = 0;
-                    // bytes 1,3,5,7,9 (5 символов)
-                    for (int k = 1; k <= 9; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    // bytes 14,16,18,20,22,24 (6 символов)
-                    for (int k = 14; k <= 24; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    // bytes 28,30 (2 символа)
-                    for (int k = 28; k <= 30; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    // Вставляем в начало lfn_buf (LFN-записи идут в обратном порядке)
-                    // Сдвигаем существующее содержимое вправо
-                    int chlen = 0;
-                    while (chlen < 13 && chunk[chlen] != 0) chlen++;
-                    if (lfn_len + chlen < 32) {
-                        for (int k = lfn_len - 1; k >= 0; k--)
-                            lfn_buf[k + chlen] = lfn_buf[k];
-                        for (int k = 0; k < chlen; k++)
-                            lfn_buf[k] = chunk[k];
-                        lfn_len += chlen;
-                    }
-                    lfn_buf[lfn_len] = 0;
+                    fat32_lfn_accumulate(raw, lfn_buf, &lfn_len, sizeof(lfn_buf));
                     continue;
                 }
 

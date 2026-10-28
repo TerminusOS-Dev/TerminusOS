@@ -139,12 +139,6 @@ void mouse_handle_packet() {
     // Читаем байт ВСЕГДА (чтобы освободить буфер)
     uint8_t data = inb(MOUSE_DATA_PORT);
 
-    serial_write("[MOUSE] byte=");
-    serial_hex8(data);
-    serial_write(" st=");
-    serial_hex8(status);
-    serial_write("\n");
-
     // Бит 5 = 0 означает данные от клавиатуры попали сюда — игнорируем
     if (!(status & 0x20)) return;
 
@@ -158,40 +152,26 @@ void mouse_handle_packet() {
     if (packet_index == 3) {
         packet_index = 0;
 
-        // Парсим пакет
         uint8_t buttons = mouse_packet[0] & 0x07;
         int8_t dx = (int8_t)mouse_packet[1];
         int8_t dy = (int8_t)mouse_packet[2];
 
-        // X overflow и Y overflow флаги: за один пакет накопилось больше,
-        // чем влезает в знаковые 8 бит. Раньше при overflow дельта просто
-        // обнулялась — при быстром движении мыши overflow срабатывает
-        // регулярно, и курсор начинал "терять" часть движений, отсюда
-        // рывки/странное поведение именно на быстрых движениях. Вместо
-        // обнуления — берём максимально возможную величину в нужную
-        // сторону (знак уже виден в самом dx/dy, даже переполненном).
+        // Overflow: clamp to max instead of zeroing (keeps fast flicks)
         if (mouse_packet[0] & 0x40) dx = (dx < 0) ? -128 : 127;
         if (mouse_packet[0] & 0x80) dy = (dy < 0) ? -128 : 127;
 
-        // Сырая дельта — до клампа, для скролл-жестов (см. mouse.h)
-        mouse_state.raw_dx = dx;
-        mouse_state.raw_dy = -dy;   // тот же инверт Y, что и ниже для x/y
+        // Accumulate raw deltas (userspace reads & clears via syscall)
+        mouse_state.raw_dx += dx;
+        mouse_state.raw_dy += -dy;
 
-        // Обновляем координаты (Y инвертирован)
         mouse_state.x += dx;
         mouse_state.y -= dy;
 
-        // Ограничиваем в пределы ТЕКУЩЕГО экрана (а не захардкоженных
-        // 640x480 — в 320x200 это раньше пускало курсор далеко за край).
         int scr_w = gfx_get_width();
         int scr_h = gfx_get_height();
-        if (scr_w <= 0) scr_w = 640;   // на случай вызова до входа в GUI
+        if (scr_w <= 0) scr_w = 640;
         if (scr_h <= 0) scr_h = 480;
 
-        // До самого последнего пикселя экрана — спрайт курсора при этом
-        // естественно обрежется по краю (gfx_put_pixel и cursor_save/
-        // restore уже сами проверяют границы на каждый пиксель), так что
-        // резервировать под него отдельный "запас" не нужно.
         int max_x = scr_w - 1;
         int max_y = scr_h - 1;
         if (max_x < 0) max_x = 0;
@@ -204,16 +184,6 @@ void mouse_handle_packet() {
 
         mouse_state.buttons = buttons;
         packet_ready = 1;
-
-        serial_write("[MOUSE] pkt dx=");
-        serial_dec(dx);
-        serial_write(" dy=");
-        serial_dec(dy);
-        serial_write(" -> x=");
-        serial_dec(mouse_state.x);
-        serial_write(" y=");
-        serial_dec(mouse_state.y);
-        serial_write("\n");
     }
 }
 

@@ -2,8 +2,20 @@
 #include "../lib/screen.h"
 #include "../drivers/fat32.h"
 #include "../drivers/disk.h"
+#include "../lib/heap.h"
 
 void cmd_meminfo() {
+    println("--- Heap ---");
+    auto print_kb = [](size_t bytes) {
+        char tmp[12]; int t = 0; uint32_t n = (uint32_t)(bytes / 1024);
+        if (n == 0) { print_char('0'); }
+        else { while (n > 0) { tmp[t++] = (char)('0' + n % 10); n /= 10; } for (int j = t - 1; j >= 0; j--) print_char(tmp[j]); }
+    };
+    print("Heap total     : "); print_kb(heap_total()); println(" KB");
+    print("Heap used      : "); print_kb(heap_used());  println(" KB");
+    print("Heap free      : "); print_kb(heap_free());  println(" KB");
+    print("Heap integrity : "); println(heap_check() ? "OK" : "CORRUPTED");
+    println("");
     println("--- FAT32 Memory Info ---");
 
     uint32_t sectors_per_fat = fat32_get_sectors_per_fat();

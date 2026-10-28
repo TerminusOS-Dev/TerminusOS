@@ -8,7 +8,7 @@
 ;
 ;   A) HDD/USB прямая загрузка (disk.img записан через dd):
 ;      BIOS грузит ТОЛЬКО этот сектор (512 байт) на 0x7C00.
-;      Код сам читает Stage 2 с диска (LBA/CHS) в память 0x7E00.
+;      Код сам читает Stage 2 с диска (CHS) в память 0x7E00.
 ;
 ;   B) ISO/CD-ROM через El-Torito "no emulation boot":
 ;      BIOS грузит ВЕСЬ disk.img (через -boot-load-size) единым
@@ -19,6 +19,21 @@
 ;   самом начале stage2.bin: если она уже видна по адресу 0x7E00
 ;   сразу после старта — значит мы в сценарии (B) и просто прыгаем
 ;   дальше; если там мусор — мы в сценарии (A) и читаем с диска.
+;
+; ПОЧЕМУ ТОЛЬКО CHS (без Extended LBA AH=0x41/0x42):
+;   На части реального железа (подтверждено на плате P4/DDR2)
+;   расширенные функции int13h либо ложно заявляются поддерживаемыми,
+;   либо сам вызов AH=0x42 виснет намертво. Мы читаем буквально первые
+;   ~100 секторов диска — это гарантированно попадает в CHS-адресуемую
+;   зону на ЛЮБОМ диске независимо от его полного объёма (ограничения
+;   CHS начинаются далеко за пределами первых мегабайт). Так что менять
+;   тут нечего — простой AH=0x02 надёжнее на живом железе и вдобавок
+;   компактнее по коду.
+;
+; ДИАГНОСТИКА: после "TerminusOS MBR" на экране должны появиться по
+; очереди символы "1" (диск сброшен), "G" (геометрия определена),
+; "2" (Stage 2 прочитан). На каком из них останавливается — та функция
+; int13h и виснет на этой плате.
 ;
 ; Раскладка диска:
 ;   Сектор  0      : stage1.bin  (этот файл)
@@ -53,22 +68,15 @@ _start:
     cmp dword [STAGE2_ADDR], STAGE2_MAGIC
     je .jump_to_stage2          ; Уже преднагружено BIOS — диск не трогаем
 
-; --- Сценарий A: грузим Stage 2 сами (HDD/USB) -----------------------
-    call detect_ext
+; --- Сценарий A: грузим Stage 2 сами (HDD/USB), только CHS -----------
+    call reset_disk
+    mov al, '1'
+    call putc
 
-    cmp byte [has_ext], 0
-    je .chs_path
+    call get_geometry
+    mov al, 'G'
+    call putc
 
-; ---- Путь 1: Extended LBA Read (быстрый, одним вызовом) ----
-    mov ah, 0x42
-    mov dl, [boot_drive]
-    mov si, dap
-    int 0x13
-    jc .disk_err
-    jmp .jump_to_stage2
-
-; ---- Путь 2: CHS Read (по сектору, для совместимости) -------
-.chs_path:
     mov word [cur_lba], 1
     mov word [buf_off], STAGE2_ADDR
     mov cx, STAGE2_SECTORS       ; Читаем все зарезервированные секторы
@@ -77,18 +85,30 @@ _start:
 
 .chs_loop:
     push cx
+    mov byte [retry_cnt], 5
+
+.chs_read_retry:
     call lba_to_chs             ; -> ch=cyl, cl=sector, dh=head
 
     mov ax, 0x0201               ; AH=02 (read), AL=1 сектор
     mov bx, [buf_off]
     mov dl, [boot_drive]
     int 0x13
-    jc .disk_err
+    jnc .chs_read_ok
 
+    call reset_disk
+    dec byte [retry_cnt]
+    jnz .chs_read_retry
+    jmp .disk_err
+
+.chs_read_ok:
     add word [buf_off], 512
     inc word [cur_lba]
     pop cx
     loop .chs_loop
+
+    mov al, '2'
+    call putc
 
 .jump_to_stage2:
     jmp 0x0000:(STAGE2_ADDR + 4)  ; +4 — пропустить 4-байтную метку
@@ -99,22 +119,20 @@ _start:
     cli
     hlt
 
-; --- Определить поддержку расширений int13h, иначе геометрию --------
-detect_ext:
-    mov ah, 0x41
-    mov bx, 0x55AA
+; --- Сброс дискового контроллера (AH=0) -------------------------------
+; Обязателен перед первым чтением на реальном железе — без него первый
+; int13h после передачи управления от BIOS иногда виснет намертво.
+; В QEMU/VirtualBox диск эмулируется как всегда "готовый", поэтому там
+; это никогда не проявляется.
+reset_disk:
+    xor ah, ah
     mov dl, [boot_drive]
     int 0x13
-    jc .no_ext
-    cmp bx, 0xAA55
-    jne .no_ext
-
-    mov byte [has_ext], 1
     ret
 
-.no_ext:
-    mov byte [has_ext], 0
-
+; --- Геометрия диска через древнюю (универсально поддерживаемую)
+; функцию AH=0x08. Если BIOS вернула мусор — безопасный дефолт 63/16.
+get_geometry:
     push es
     push di
     mov ah, 0x08
@@ -165,6 +183,17 @@ lba_to_chs:
     pop ax
     ret
 
+; --- putc: вывести один символ из AL через BIOS -----------------------
+putc:
+    push ax
+    push bx
+    mov ah, 0x0E
+    xor bx, bx
+    int 0x10
+    pop bx
+    pop ax
+    ret
+
 ; --- puts: вывести строку через BIOS ----------------------------------
 puts:
     lodsb
@@ -181,21 +210,11 @@ puts:
 msg_boot    db "TerminusOS MBR", 0x0D, 0x0A, 0
 msg_err     db "Disk error!", 0x0D, 0x0A, 0
 boot_drive  db 0x80
-has_ext     db 0
+retry_cnt   db 0
 spt         dw 63
 heads       dw 16
 cur_lba     dw 0
 buf_off     dw 0
-
-; --- Disk Address Packet (для Extended LBA Read) -----------------------
-align 4
-dap:
-    db 0x10                 ; Размер DAP
-    db 0x00                 ; Зарезервировано
-    dw STAGE2_SECTORS       ; Секторов читать (весь зарезервированный Stage 2)
-    dw STAGE2_ADDR  ; Буфер: смещение
-    dw 0x0000       ; Буфер: сегмент
-    dq 1            ; LBA начало (сразу после MBR)
 
 ; --- Подпись MBR ----------------------------------------------------------
     times 510-($-$$) db 0

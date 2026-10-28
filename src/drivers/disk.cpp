@@ -28,8 +28,15 @@
 #define ATA_CMD_IDENTIFY   0xEC
 #define ATA_CMD_SRST       0x04   // Software Reset (в DEV_CONTROL)
 
-// ── Таймаут (~300мс при ~1МГц порта) ────────────────────────────────────────
-#define ATA_TIMEOUT 100000
+// ── Таймаут ──────────────────────────────────────────────────────────────────
+// Раньше было 100000 (~100-300мс при ~1мкс/inb на реальном железе — см. оценку
+// автора ниже). В QEMU виртуальный диск отвечает почти мгновенно, так что там
+// этого хватало всегда — а вот на настоящем (тем более старом/потрёпанном)
+// механическом винте раскрутка и поиск после сброса легко может занять секунды.
+// Итерационный счётчик — по своей природе не "реальное время", а грубая оценка,
+// зависящая от скорости порта/шины; чтобы не сдаваться раньше, чем диск
+// реально успел ответить, бюджет увеличен на порядок (~5с на том же расчёте).
+#define ATA_TIMEOUT 5000000
 
 
 // **********************************************
@@ -73,9 +80,11 @@ static void ata_400ns_delay() {
 
 // Ждём пока BSY не снимется. Возвращает false при таймауте.
 static bool ata_wait_bsy() {
+    bool warned = false;
     for (int i = 0; i < ATA_TIMEOUT; i++) {
         if (!(inb(ATA_STATUS) & ATA_SR_BSY))
             return true;
+        if (!warned && i == ATA_TIMEOUT / 4) { println("[ata] wait_bsy: still polling (25%)..."); warned = true; }
     }
     println("ATA: timeout waiting for BSY=0");
     return false;
@@ -83,10 +92,12 @@ static bool ata_wait_bsy() {
 
 // Ждём BSY=0 И DRDY=1 (диск готов принять команду). Возвращает false при таймауте.
 static bool ata_wait_ready() {
+    bool warned = false;
     for (int i = 0; i < ATA_TIMEOUT; i++) {
         uint8_t status = inb(ATA_STATUS);
         if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRDY))
             return true;
+        if (!warned && i == ATA_TIMEOUT / 4) { println("[ata] wait_ready: still polling (25%)..."); warned = true; }
     }
     println("ATA: timeout waiting for DRDY=1");
     return false;
@@ -94,6 +105,7 @@ static bool ata_wait_ready() {
 
 // Ждём DRQ=1 (данные готовы к передаче). Возвращает false при ошибке/таймауте.
 static bool ata_wait_drq() {
+    bool warned = false;
     for (int i = 0; i < ATA_TIMEOUT; i++) {
         uint8_t status = inb(ATA_STATUS);
         if (status & ATA_SR_ERR || status & ATA_SR_DF) {
@@ -102,6 +114,7 @@ static bool ata_wait_drq() {
         }
         if (status & ATA_SR_DRQ)
             return true;
+        if (!warned && i == ATA_TIMEOUT / 4) { println("[ata] wait_drq: still polling (25%)..."); warned = true; }
     }
     println("ATA: timeout waiting for DRQ=1");
     return false;

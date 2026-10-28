@@ -45,7 +45,6 @@
 %define MB_INFO     0x9000      ; Адрес Multiboot Info
 %define STACK_TOP   0x9F000     ; Вершина стека в PM
 %define KERN_LBA    66          ; LBA ядра: 0x7C00+66*512 = 0x10000
-%define CHUNK_SECTS 128         ; Секторов за одно чтение (64KB) макс.
 
 %ifndef KERNEL_SECTORS
 %define KERNEL_SECTORS 1024     ; fallback: 512KB, если не передано
@@ -82,7 +81,7 @@ stage2_start:
     pop es
     je .kernel_already_loaded
 
-    call detect_ext
+    call get_geometry
     call load_kernel_elf
     jmp .pm_switch
 
@@ -261,25 +260,13 @@ vbe_setup:
     call puts16
     ret
 
-detect_ext:
-
-
-    mov ah, 0x41
-    mov bx, 0x55AA
-    mov dl, [boot_drive]
-    int 0x13
-    jc .no_ext
-    cmp bx, 0xAA55
-    jne .no_ext
-
-    mov byte [has_ext], 1
-    mov si, msg_ext_yes
-    call puts16
-    ret
-
-.no_ext:
-    mov byte [has_ext], 0
-
+; --- Геометрия диска через древнюю (универсально поддерживаемую)
+; функцию AH=0x08. БЕЗ проверки Extended LBA (AH=0x41/0x42) — именно
+; она виснет/ребутит машину на реальном железе (подтверждено: BIOS
+; здесь честно печатает "EXT LBA OK", но сам чанковый AH=0x42-путь
+; в load_kernel_elf роняет систему в reset). Та же история и то же
+; решение, что и в stage1.asm — только CHS.
+get_geometry:
     push es
     push di
     mov ah, 0x08
@@ -306,7 +293,7 @@ detect_ext:
     mov word [heads], 16
 
 .done:
-    mov si, msg_ext_no
+    mov si, msg_geom_ok
     call puts16
     ret
 
@@ -343,40 +330,7 @@ load_kernel_elf:
     mov si, msg_loading
     call puts16
 
-    cmp byte [has_ext], 0
-    je .chs_mode
-
-; ---------- Extended LBA путь (быстрый, чанками по 64KB) ----------
-    mov word  [remaining],  KERNEL_SECTORS
-    mov word  [dap_seg],    0x1000
-    mov dword [dap_lba_lo], KERN_LBA
-    mov dword [dap_lba_hi], 0
-
-.ext_loop:
-    mov ax, [remaining]
-    test ax, ax
-    jz .read_done
-
-    cmp ax, CHUNK_SECTS
-    jbe .set_count
-    mov ax, CHUNK_SECTS
-.set_count:
-    mov [dap_count], ax
-
-    mov ah, 0x42
-    mov dl, [boot_drive]
-    mov si, dap
-    int 0x13
-    jc .disk_error
-
-    movzx ecx, word [dap_count]
-    sub  [remaining], cx
-    add  word [dap_seg], 0x1000
-    add  dword [dap_lba_lo], ecx
-
-    jmp .ext_loop
-
-; ---------- CHS путь (по сектору, для совместимости) ---------------
+; ---------- CHS путь (единственный — см. комментарий у get_geometry) ---
 .chs_mode:
     mov word [cur_lba_lo], KERN_LBA
     mov word [buf_seg],    0x1000   ; ES сегмент буфера (физ. 0x10000)
@@ -445,8 +399,7 @@ puts16:
 msg_hello     db "Stage2: TerminusOS Bootloader", 0x0D, 0x0A, 0
 msg_a20       db "  A20 OK", 0x0D, 0x0A, 0
 msg_mem       db "  Memory OK", 0x0D, 0x0A, 0
-msg_ext_yes   db "  EXT LBA OK", 0x0D, 0x0A, 0
-msg_ext_no    db "  CHS fallback", 0x0D, 0x0A, 0
+msg_geom_ok   db "  CHS geometry OK", 0x0D, 0x0A, 0
 msg_loading   db "  Loading kernel.elf...", 0
 msg_preloaded db "  Kernel preloaded (ISO)", 0x0D, 0x0A, 0
 msg_ok        db " OK", 0x0D, 0x0A, 0
@@ -469,28 +422,11 @@ mem_lower   dd 640
 mem_upper   dd 0
 remaining   dw 0
 
-has_ext     db 0
 spt         dw 63
 heads       dw 16
 cur_lba_lo  dw 0
 buf_seg     dw 0
 buf_off     dw 0
-
-; --- Disk Address Packet (для Extended LBA Read) --------------------------
-align 4
-dap:
-    db 0x10
-    db 0x00
-dap_count:
-    dw CHUNK_SECTS
-dap_offset:
-    dw 0
-dap_seg:
-    dw 0x1000
-dap_lba_lo:
-    dd KERN_LBA
-dap_lba_hi:
-    dd 0
 
 ; --- GDT --------------------------------------------------------------------
 align 8

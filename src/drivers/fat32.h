@@ -117,6 +117,9 @@ void fat32_init();
 // ===== БАЗОВЫЕ ФУНКЦИИ =====
 uint32_t fat32_cluster_to_lba(uint32_t cluster);
 uint32_t fat32_get_next_cluster(uint32_t current_cluster);
+uint32_t fat32_read_file_to_buffer(uint32_t start_cluster, uint32_t file_size,
+                                    uint8_t* buf, uint32_t buf_max);
+void fat32_lfn_accumulate(const uint8_t* raw, char* lfn_buf, int* lfn_len, int lfn_buf_size);
 uint32_t fat32_find_free_cluster();
 void     fat32_set_entry(uint32_t cluster, uint32_t value);
 void     fat32_write_cluster_data(uint32_t cluster, const uint8_t* data,

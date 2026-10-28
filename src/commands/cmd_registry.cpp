@@ -16,8 +16,10 @@
 #include "cmd_banner.h"
 #include "cmd_panic.h"
 #include "cmd_meminfo.h"
-#include "cmd_gui.h"
+#include "cmd_paint.h"
 #include "cmd_widgets.h"
+#include "cmd_gite.h"
+#include "cmd_run.h"
 
 // Команды из builtin (shell/builtin.h) — сигнатуры char*, не const char*
 extern void cmd_fat_check();
@@ -77,7 +79,8 @@ const CmdEntry CMD_TABLE[] = {
     { "info",      ARG_NONE,  cmd_info,       nullptr,                  nullptr },
     { "uptime",    ARG_NONE,  cmd_uptime,     nullptr,                  nullptr },
     { "panic",     ARG_NONE,  cmd_panic,       nullptr,                  nullptr },
-    { "gui",       ARG_OPT,   nullptr,        cmd_gui,                  "gui [640]" },
+    { "paint",     ARG_OPT,   nullptr,        cmd_paint,                "paint [640]" },
+    { "image", ARG_FILE, nullptr, (void(*)(const char*))cmd_image, "image <file.bmp> - view BMP" },
     { "widgets",  ARG_OPT,   nullptr,        cmd_widgets,              "widgets [640]" },
 
     { "echo",      ARG_TEXT,  nullptr, [](const char* a){ println(a); }, "Usage: echo <text>" },
@@ -88,6 +91,8 @@ const CmdEntry CMD_TABLE[] = {
 
     { "cat",       ARG_FILE,  nullptr, wrap_disk_cat, "Usage: cat <file>" },
     { "nano",      ARG_FILE,  nullptr, wrap_nano,   "Usage: nano <file>" },
+    { "gite", ARG_OPT, nullptr, (void(*)(const char*))cmd_gite, "gite [file] - graphical editor" },
+    { "run", ARG_FILE, nullptr, (void(*)(const char*))cmd_run, "Usage: run [-d] <elf-file>" },
     { "edit",      ARG_FILE,  nullptr, wrap_nano,   "Usage: edit <file>" },
     { "create",    ARG_FILE,  nullptr, wrap_create, "Usage: create <file>" },
     { "rm",        ARG_FILE,  nullptr, wrap_rm,    "Usage: rm <file>" },

@@ -13,8 +13,13 @@
 #include "../drivers/vga_gfx.h"
 #include "../drivers/serial.h"
 #include "interrupts.h"
+#include "gdt.h"
 #include "mouse.h"
-
+#include "../lib/clipboard.h"
+#include "../lib/heap.h"
+#include "syscall.h"
+#include "elf_loader.h"
+#include "version.h"
 extern "C" {
     void panic(const char* message);
 }
@@ -61,10 +66,28 @@ extern "C" void kmain(MultibootInfo* mbi) {
     serial_init();
     serial_write("\n[BOOT] serial up\n");
 
+    gdt_init();
+    serial_write("[BOOT] gdt up (extended w/ TLS slots)\n");
+
     // ─── ВАЖНО: init_idt() раньше нигде не вызывался -> IDT/PIC не настроены,
     // sti не выполнялся, IRQ12 (мышь) был мёртвым кодом. Вызываем ДО mouse_init().
     init_idt();
     serial_write("[BOOT] IDT+PIC done\n");
+
+    // PIT @ TIMER_HZ — нужен для clock()/gettimeofday/clock_gettime (linpack и др.)
+    timer_init();
+    serial_write("[BOOT] timer up\n");
+
+    heap_init();
+    serial_write("[BOOT] heap up\n");
+
+    syscall_init();
+    serial_write("[BOOT] syscalls (int 0x80) up\n");
+
+    if (mbi && (mbi->flags & 0x1)) {
+        elf_set_mem_upper_kb(mbi->mem_upper);
+        serial_write("[BOOT] mem_upper set\n");
+    }
 
     // Инициализация FAT
     // ─── Инициализация LFB из Multiboot ──────────────────────────────────────
@@ -101,6 +124,7 @@ extern "C" void kmain(MultibootInfo* mbi) {
 
     config_load();
     shell_load_history_file();
+    clipboard_load();
     // Очищаем экран
     for(int i=0;i<80*25;i++) video_memory[i]=0x0F00;
 
@@ -113,7 +137,7 @@ extern "C" void kmain(MultibootInfo* mbi) {
     shell_draw_status_bar();
     // Выводим приветствие
     cursor_pos = 80;
-    println("Welcome to TerminusOS 0.4.7!");
+    println(OS_WELCOME_MSG);
     println("Type 'help' for commands.");
     
     shell_print_prompt();
@@ -136,8 +160,12 @@ extern "C" void kmain(MultibootInfo* mbi) {
             case CHAR_PGDN:
                 shell_handle_pgdn();
                 break;
+            case CHAR_WIN_V:
+                shell_clipboard_popup();
+                break;
             case '\n':
                 if (shell_is_in_scrollback()) { shell_exit_scrollback(); break; }
+                shell_sel_collapse(true);      // убрать подсветку выделения перед выполнением
                 tab_reset();
                 history_index = -1;
                 print_char('\n');
@@ -154,17 +182,15 @@ extern "C" void kmain(MultibootInfo* mbi) {
                 shell_handle_tab(true);
                 break;
 
-            case CHAR_DEL: {
-                if (cursor_offset < buf_len) {
-                    for (int i = cursor_offset; i < buf_len; i++) buffer[i] = buffer[i+1];
-                    buf_len--;
-                    buffer[buf_len] = 0;
-                    shell_redraw();
-                }
+            case CHAR_DEL:
+                shell_delete_forward();
                 break;
-            }
 
             case CHAR_CTRL_C:
+                // Есть выделение — копируем его в буфер обмена, строку не трогаем.
+                // Нет выделения — как раньше: отмена текущей строки.
+                if (shell_copy_selection()) break;
+                shell_sel_clear();
                 buf_len = 0;
                 cursor_offset = 0;
                 buffer[0] = 0;
@@ -176,27 +202,72 @@ extern "C" void kmain(MultibootInfo* mbi) {
 
             case CHAR_CTRL_A:
             case CHAR_HOME:
+                shell_sel_clear();
                 cursor_offset = 0;
                 shell_redraw();
                 break;
 
             case CHAR_CTRL_E:
             case CHAR_END:
+                shell_sel_clear();
                 cursor_offset = buf_len;
                 shell_redraw();
                 break;
 
                 
+            case CHAR_CTRL_X:
+                shell_cut_selection();
+                break;
+
+            case CHAR_CTRL_V:
+                if (shell_is_in_scrollback()) shell_exit_scrollback();
+                shell_paste_latest();
+                break;
+
+            case CHAR_CTRL_K:
+                shell_copy_line();
+                break;
+
+            case CHAR_CTRL_SHIFT_A:
+                shell_select_all();
+                break;
+
+            case CHAR_SHIFT_LEFT:
+                shell_select_extend(0);
+                break;
+
+            case CHAR_CTRL_SHIFT_LEFT:
+                shell_select_extend(2);
+                break;
+
+            case CHAR_CTRL_SHIFT_RIGHT:
+                shell_select_extend(3);
+                break;
+
             case '\b':
                 shell_delete_char();
                 break;
                 
             case CHAR_ARROW_LEFT:
+                if (shell_sel_collapse(false)) break;
                 if (cursor_offset > 0) cursor_offset--;
                 shell_redraw();
                 break;
+
+            case CHAR_CTRL_LEFT:
+                shell_word_left();
+                break;
+
+            case CHAR_CTRL_RIGHT:
+                shell_word_right();
+                break;
+
+            case CHAR_CTRL_BACKSPACE:
+                shell_delete_word_left();
+                break;
                 
             case CHAR_ARROW_RIGHT:
+                if (shell_sel_collapse(true)) break;
                 if (cursor_offset < buf_len) {
                     cursor_offset++;
                     shell_redraw();
@@ -208,9 +279,8 @@ extern "C" void kmain(MultibootInfo* mbi) {
             case CHAR_SHIFT_RIGHT:
                 if (shell_has_suggestion()) {
                     shell_tab_accept_one();
-                } else if (cursor_offset < buf_len) {
-                    cursor_offset++;
-                    shell_redraw();
+                } else {
+                    shell_select_extend(1);
                 }
                 break;
                 

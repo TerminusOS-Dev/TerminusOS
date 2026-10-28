@@ -2,6 +2,7 @@
 #include "../lib/screen.h"
 #include "../shell/shell.h"
 #include "../lib/scrollback.h"
+#include "../kernel/version.h"
 
 void cmd_clear() {
     uint8_t attr = get_theme_color();
@@ -13,6 +14,8 @@ void cmd_clear() {
         }
     }
     scrollback_reset();
-    cursor_pos = 160; 
+    cursor_pos = 80;
     shell_draw_status_bar();
+    println(OS_WELCOME_MSG);
+    println("Type 'help' for commands.");
 }

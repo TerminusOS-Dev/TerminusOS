@@ -11,7 +11,7 @@
 int gfx_get_width();
 int gfx_get_height();
 
-// ─── Индексы стандартных цветов VGA (0-15) ───────────────────────────────────
+// ─── Индексы стандартных цветов VGA (0-15); полная палитра 0-255 ─────────────
 #define GFX_BLACK         0
 #define GFX_BLUE          1
 #define GFX_GREEN         2
@@ -28,6 +28,7 @@ int gfx_get_height();
 #define GFX_LIGHT_MAGENTA 13
 #define GFX_YELLOW        14
 #define GFX_WHITE         15
+// 16-31: серые, 32-247: куб 6×6×6 RGB, 248-255: доп. серые (gfx_init_palette)
 
 bool vga_gfx_active();
 bool vga_lfb_available();
@@ -39,9 +40,9 @@ void vga_enter_mode_640x480(); // 640x480x256 (Mode X, plane-based)
 void vga_exit_to_text();       // Вернуться в текстовый режим 80x25
 void vga_init_text_mode();     // Инициализация текстового режима при старте ядра
 
-// ─── Палитра (r, g, b — значения 0-63) ───────────────────────────────────────
+// ─── Палитра (r, g, b — значения 0-63; idx 0-255) ────────────────────────────
 void gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b);
-void gfx_init_palette();   // Загрузить стандартные 16 цветов VGA
+void gfx_init_palette();   // Загрузить полную 256-цветную палитру VGA
 
 // ─── Примитивы рисования (будущий API для программ) ─────────────────────────
 void gfx_put_pixel(int x, int y, uint8_t color);
@@ -76,6 +77,7 @@ int  gfx_cursor_get_x();
 int  gfx_cursor_get_y();
 // Быстрое обновление позиции без полного flip (курсор двинулся, сцена нет)
 void gfx_cursor_update_pos();
+void gfx_cursor_blit_backbuffer(int x, int y);  // курсор в backbuffer (анти‑мерцание)
 // Устаревшие — оставлены для совместимости
 void gfx_cursor_save   (int x, int y);
 void gfx_cursor_restore(int x, int y);

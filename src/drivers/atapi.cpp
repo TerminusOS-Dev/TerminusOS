@@ -74,7 +74,7 @@ static bool atapi_send_packet(const uint8_t* packet, uint8_t* out_buf, uint16_t 
     outb(ATAPI_DRIVE_SEL, 0xA0);
     atapi_delay();
 
-    if (!atapi_wait_bsy(10000)) return false;
+    if (!atapi_wait_bsy(100000)) return false;
 
     // Устанавливаем byte count (ожидаемый размер ответа)
     outb(ATAPI_FEATURES, 0x00);         // PIO mode, non-DMA
@@ -86,7 +86,7 @@ static bool atapi_send_packet(const uint8_t* packet, uint8_t* out_buf, uint16_t 
     atapi_delay();
 
     // Ждём DRQ — привод готов принять пакет
-    if (!atapi_wait_drq(10000)) return false;
+    if (!atapi_wait_drq(100000)) return false;
 
     // Передаём 12-байтный пакет словами (6 слов по 2 байта)
     const uint16_t* pw = (const uint16_t*)packet;
@@ -94,12 +94,12 @@ static bool atapi_send_packet(const uint8_t* packet, uint8_t* out_buf, uint16_t 
 
     // Если нет выходного буфера — всё
     if (!out_buf || out_size == 0) {
-        atapi_wait_bsy(50000);
+        atapi_wait_bsy(500000);
         return true;
     }
 
     // Ждём DRQ — привод готов отдать данные
-    if (!atapi_wait_drq(100000)) return false;
+    if (!atapi_wait_drq(1000000)) return false;
 
     // Проверяем реальный byte count от привода
     uint16_t actual = ((uint16_t)inb(ATAPI_BYTE_HI) << 8) | inb(ATAPI_BYTE_LO);
@@ -116,7 +116,7 @@ static bool atapi_send_packet(const uint8_t* packet, uint8_t* out_buf, uint16_t 
         out_buf[actual - 1] = (uint8_t)(last & 0xFF);
     }
 
-    atapi_wait_bsy(50000);
+    atapi_wait_bsy(500000);
     return true;
 }
 
@@ -133,7 +133,7 @@ bool atapi_detect() {
     outb(ATAPI_CONTROL, 0x00); // SRST=0
     atapi_delay();
 
-    if (!atapi_wait_bsy(20000)) return false;
+    if (!atapi_wait_bsy(200000)) return false;
 
     // Признак ATAPI после сброса: LBA_LO=0x14, LBA_HI=0xEB
     uint8_t lo = inb(ATAPI_LBA_LO + 1); // 0x174
@@ -147,7 +147,7 @@ bool atapi_detect() {
     outb(ATAPI_COMMAND, ATA_CMD_IDENTIFY_PACKET);
     atapi_delay();
 
-    if (!atapi_wait_bsy(10000)) return false;
+    if (!atapi_wait_bsy(100000)) return false;
     uint8_t st = inb(ATAPI_STATUS);
     if (!(st & ATA_SR_DRQ)) return false;
 

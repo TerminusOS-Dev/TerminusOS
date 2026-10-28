@@ -72,9 +72,25 @@ idt_flush:
     lidtl (%eax)
     ret
 
-# ==================================
-# ISRs БЕЗ КОДА ОШИБКИ (0-7, 9, 15, 16, 18-31)
-# ==================================
+# GDT FLUSH (загрузка регистра GDTR + перезагрузка сегментных регистров)
+# Селекторы 0x08/0x10 те же, что уже стоят — поэтому это "невидимая" замена
+# GDT загрузчика на нашу собственную (расширенную под TLS), а не смена
+# текущих сегментов на что-то другое.
+.global gdt_flush
+.type gdt_flush, @function
+gdt_flush:
+    mov 4(%esp), %eax
+    lgdt (%eax)
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    mov %ax, %ss
+    ljmp $0x08, $.gdt_flush_cs
+.gdt_flush_cs:
+    ret
+
 
 # ISR 0
 .type isr0, @function
@@ -655,4 +671,50 @@ irq15:
     pop %eax
     popa
     add $4, %esp
+    iret
+
+# ==================================
+# int 0x80 — syscall'ы
+# Своя, отдельная от ISR/IRQ конвенция (не переиспользует их struct registers,
+# чтобы не рисковать несовпадением раскладки с уже рабочим кодом выше).
+# Классические регистры Linux i386: eax=номер сисколла, ebx/ecx/edx=аргументы.
+# syscall_dispatch(num, arg1, arg2, arg3) — cdecl, возврат в eax.
+# ==================================
+.global isr128
+.extern syscall_dispatch
+.type isr128, @function
+isr128:
+    # Linux i386: eax=num, ebx/ecx/edx/esi/edi/ebp = arg1..arg6; возврат в eax.
+    # ВАЖНО: настоящий int 0x80 в Linux сохраняет ВСЕ регистры, кроме eax
+    # (возвращаемое значение). ebx/esi/edi/ebp — callee-saved по cdecl, их
+    # автоматически спасает компилятор при вызове syscall_dispatch. Но ecx
+    # и edx в cdecl — caller-saved, их НИКТО не обязан сохранять, и
+    # syscall_dispatch (переходы, арифметика, вложенные вызовы) их почти
+    # гарантированно затирает. Libc (musl) полагается на то, что ecx/edx
+    # переживут syscall — раньше это было не так, что приводило к порче
+    # указателей/счётчиков, хранящихся в ecx/edx поперёк syscall'а (мусорные
+    # пути при chdir, зависания в malloc/stdio и т.п.). Восстанавливаем их
+    # явно из уже сохранённых на стеке исходных значений аргументов.
+    push %ebp
+    push %edi
+    push %esi
+    # аргументы cdecl справа налево: arg6..arg1, num
+    push %ebp              # arg6
+    push %edi              # arg5
+    push %esi              # arg4
+    push %edx              # arg3
+    push %ecx              # arg2
+    push %ebx              # arg1
+    push %eax              # num
+    call syscall_dispatch
+    # восстановить ebx/ecx/edx из ИСХОДНЫХ (до-syscall) значений аргументов,
+    # которые всё ещё лежат в стеке нетронутыми (память аргументов cdecl-
+    # вызовов callee не модифицирует)
+    movl 4(%esp), %ebx      # исходный arg1 (ebx)
+    movl 8(%esp), %ecx      # исходный arg2 (ecx)
+    movl 12(%esp), %edx     # исходный arg3 (edx)
+    add $28, %esp          # 7 args * 4
+    pop %esi
+    pop %edi
+    pop %ebp
     iret

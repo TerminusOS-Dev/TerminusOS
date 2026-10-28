@@ -26,6 +26,10 @@ SECTIONS
         *(.bss)
     } :data
 
+    . = ALIGN(4K);
+    _kernel_end = .;   /* конец образа ядра — сюда смотрит elf_loader.cpp,
+                           чтобы выбрать безопасный адрес загрузки программ */
+
     /DISCARD/ : { *(.comment) *(.eh_frame) }
 }
 

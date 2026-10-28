@@ -5,6 +5,8 @@
 !/boot/
 !/src/
 !/images/
+!/userspace/
+!/tfsutilpap/
 
 # Разрешаем конкретные файлы
 !/build.sh

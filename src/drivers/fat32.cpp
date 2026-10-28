@@ -91,6 +91,29 @@ uint32_t fat32_get_next_cluster(uint32_t current_cluster) {
     return next;
 }
 
+// Читает файл, начиная с start_cluster, в buf — до min(file_size, buf_max) байт.
+// Общий кусок, который раньше был отдельно продублирован в cmd_cp и других
+// местах (везде один и тот же цикл: сектор за сектором, кластер за кластером).
+// Возвращает реально прочитано байт.
+uint32_t fat32_read_file_to_buffer(uint32_t start_cluster, uint32_t file_size,
+                                    uint8_t* buf, uint32_t buf_max) {
+    uint32_t cluster = start_cluster;
+    uint32_t got = 0;
+    uint32_t limit = (file_size < buf_max) ? file_size : buf_max;
+    while ((cluster & FAT32_MASK) >= 2 &&
+           (cluster & FAT32_MASK) < (FAT32_EOC & FAT32_MASK) &&
+           got < limit) {
+        uint32_t lba = fat32_cluster_to_lba(cluster);
+        for (int s = 0; s < FAT32_SECTORS_PER_CLUSTER && got < limit; s++) {
+            ata_read_sector(lba + s);
+            for (int b = 0; b < FAT32_BYTES_PER_SECTOR && got < limit; b++)
+                buf[got++] = sector_buffer[b];
+        }
+        cluster = fat32_get_next_cluster(cluster);
+    }
+    return got;
+}
+
 // Инициализация FAT32: если FAT пустая — заполняем служебные записи
 // Считает разумный размер FAT (в секторах) под реальный размер диска.
 // Не пытается быть идеально оптимальным (не вычитает место под сам FAT
@@ -319,6 +342,36 @@ static bool fat32_str_ieq(const char* a, const char* b) {
     return a[i] == 0 && b[i] == 0;
 }
 
+// Разбирает одну LFN-запись каталога (raw — сырые 32 байта записи) и
+// добавляет извлечённый кусок имени (до 13 символов) В НАЧАЛО lfn_buf/lfn_len
+// — LFN-записи в FAT32 идут в обратном порядке, от последней части имени к
+// первой. Общий кусок: раньше был отдельно продублирован посимвольно
+// одинаково в fat32_find_entry (эта функция), fat32_tab_complete, а также
+// в cmd_ls_disk (builtin.cpp) и fs_read_dir (cmd_gite.cpp).
+void fat32_lfn_accumulate(const uint8_t* raw, char* lfn_buf, int* lfn_len, int lfn_buf_size) {
+    char chunk[13]; int ci = 0;
+    for (int k = 1; k <= 9; k += 2) {
+        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
+        else if (raw[k] == 0x00) chunk[ci++] = 0;
+    }
+    for (int k = 14; k <= 24; k += 2) {
+        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
+        else if (raw[k] == 0x00) chunk[ci++] = 0;
+    }
+    for (int k = 28; k <= 30; k += 2) {
+        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
+        else if (raw[k] == 0x00) chunk[ci++] = 0;
+    }
+    int chlen = 0;
+    while (chlen < 13 && chunk[chlen] != 0) chlen++;
+    if (*lfn_len + chlen < lfn_buf_size - 1) {
+        for (int k = *lfn_len - 1; k >= 0; k--) lfn_buf[k + chlen] = lfn_buf[k];
+        for (int k = 0; k < chlen; k++) lfn_buf[k] = chunk[k];
+        *lfn_len += chlen;
+    }
+    lfn_buf[*lfn_len] = 0;
+}
+
 // raw_name — исходное (не приведённое к 8.3) имя, нужно для сравнения с LFN.
 // Если raw_name == NULL, сравниваем только по короткому 8.3-имени (name_8_3).
 static FAT32_DirEntry* scan_dir_cluster(uint32_t dir_cluster,
@@ -330,8 +383,13 @@ static FAT32_DirEntry* scan_dir_cluster(uint32_t dir_cluster,
                                          int* index_out) {
     uint32_t c = dir_cluster;
     char lfn_buf[256]; int lfn_len = 0;
+    uint32_t safety = 0; // защита от зацикленной (повреждённой) цепочки кластеров
 
     while ((c & FAT32_MASK) >= 2 && (c & FAT32_MASK) < 0x0FFFFFF8) {
+        if (++safety > 100000) {
+            println("FAT32 ERROR: scan_dir_cluster cluster-chain loop guard tripped (corrupt/cyclic chain?)");
+            return NULL;
+        }
         uint32_t base_lba = fat32_cluster_to_lba(c);
 
         for (uint8_t sec = 0; sec < FAT32_SECTORS_PER_CLUSTER; sec++) {
@@ -356,29 +414,9 @@ static FAT32_DirEntry* scan_dir_cluster(uint32_t dir_cluster,
                 if (e->name[0] == (char)0xE5) { lfn_len = 0; continue; } // Удалённая запись
 
                 if (e->attributes == 0x0F) {
-                    // LFN-запись — копим кусок длинного имени (см. также cmd_ls_disk)
+                    // LFN-запись — копим кусок длинного имени
                     uint8_t* raw = (uint8_t*)e;
-                    char chunk[13]; int ci = 0;
-                    for (int k = 1; k <= 9; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    for (int k = 14; k <= 24; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    for (int k = 28; k <= 30; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    int chlen = 0;
-                    while (chlen < 13 && chunk[chlen] != 0) chlen++;
-                    if (lfn_len + chlen < (int)sizeof(lfn_buf) - 1) {
-                        for (int k = lfn_len - 1; k >= 0; k--) lfn_buf[k + chlen] = lfn_buf[k];
-                        for (int k = 0; k < chlen; k++) lfn_buf[k] = chunk[k];
-                        lfn_len += chlen;
-                    }
-                    lfn_buf[lfn_len] = 0;
+                    fat32_lfn_accumulate(raw, lfn_buf, &lfn_len, sizeof(lfn_buf));
                     continue;
                 }
 
@@ -1140,29 +1178,9 @@ int fat32_tab_complete(const char* prefix, char results[][128], int max) {
                 if (first == 0xE5) { lfn_len = 0; continue; }
 
                 if (entries[i].attributes == 0x0F) {
-                    // Копим кусок LFN-имени (та же схема, что в cmd_ls_disk/scan_dir_cluster)
+                    // Копим кусок LFN-имени
                     uint8_t* raw = (uint8_t*)&entries[i];
-                    char chunk[13]; int ci = 0;
-                    for (int k = 1; k <= 9; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    for (int k = 14; k <= 24; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    for (int k = 28; k <= 30; k += 2) {
-                        if (raw[k] != 0xFF && raw[k] != 0x00) chunk[ci++] = (char)raw[k];
-                        else if (raw[k] == 0x00) chunk[ci++] = 0;
-                    }
-                    int chlen = 0;
-                    while (chlen < 13 && chunk[chlen] != 0) chlen++;
-                    if (lfn_len + chlen < (int)sizeof(lfn_buf) - 1) {
-                        for (int k = lfn_len - 1; k >= 0; k--) lfn_buf[k + chlen] = lfn_buf[k];
-                        for (int k = 0; k < chlen; k++) lfn_buf[k] = chunk[k];
-                        lfn_len += chlen;
-                    }
-                    lfn_buf[lfn_len] = 0;
+                    fat32_lfn_accumulate(raw, lfn_buf, &lfn_len, sizeof(lfn_buf));
                     continue;
                 }
                 if (entries[i].name[0] == '.') { lfn_len = 0; continue; } // . и ..

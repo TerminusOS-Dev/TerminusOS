@@ -1,7 +1,7 @@
 #include "screen.h"
 #include "../drivers/disk.h"
 #include "../lib/string.h"
-#include "Scrollback.h"
+#include "scrollback.h"
 
 // ==========================================
 // Глобальные переменные VGA и Темы
@@ -177,6 +177,168 @@ void clear_block_cursor(int x, int y) {
     video_memory[pos] = (normal_color << 8) | ch;
 }
 
+
+// ─── Minimal ANSI/VT100 parser (enough for busybox vi / clear / colors) ───────
+static int  ansi_state = 0;   // 0=normal 1=got ESC 2=CSI params
+static int  ansi_params[8];
+static int  ansi_nparams = 0;
+static int  ansi_in_num = 0;
+static int  ansi_save_pos = 0;
+static uint8_t ansi_fg = 0xFF; // 0xFF = use theme
+static uint8_t ansi_bg = 0xFF;
+
+static uint8_t ansi_attr() {
+    uint8_t fg = (ansi_fg == 0xFF) ? theme_fg : ansi_fg;
+    uint8_t bg = (ansi_bg == 0xFF) ? theme_bg : ansi_bg;
+    return (uint8_t)((bg << 4) | (fg & 0x0F));
+}
+
+static void ansi_clamp_cursor() {
+    if (cursor_pos < 80) cursor_pos = 80; // keep status bar (row 0)
+    if (cursor_pos >= 80 * 25) cursor_pos = 80 * 25 - 1;
+}
+
+static void ansi_clear_region(int from, int to) {
+    uint16_t blank = ((uint16_t)ansi_attr() << 8) | ' ';
+    if (from < 80) from = 80;
+    if (to > 80 * 25) to = 80 * 25;
+    for (int i = from; i < to; i++) video_memory[i] = blank;
+}
+
+static void ansi_exec_csi(char final_cmd) {
+    int p0 = (ansi_nparams >= 1) ? ansi_params[0] : 0;
+    int p1 = (ansi_nparams >= 2) ? ansi_params[1] : 0;
+    int row = cursor_pos / 80;
+    int col = cursor_pos % 80;
+
+    switch (final_cmd) {
+    case 'A': {
+        int n = p0 ? p0 : 1;
+        row -= n; if (row < 1) row = 1;
+        cursor_pos = row * 80 + col;
+        break;
+    }
+    case 'B': {
+        int n = p0 ? p0 : 1;
+        row += n; if (row > 24) row = 24;
+        cursor_pos = row * 80 + col;
+        break;
+    }
+    case 'C': {
+        int n = p0 ? p0 : 1;
+        col += n; if (col > 79) col = 79;
+        cursor_pos = row * 80 + col;
+        break;
+    }
+    case 'D': {
+        int n = p0 ? p0 : 1;
+        col -= n; if (col < 0) col = 0;
+        cursor_pos = row * 80 + col;
+        break;
+    }
+    case 'H': case 'f': {
+        int r = p0 ? p0 : 1;
+        int c = p1 ? p1 : 1;
+        if (r < 1) r = 1; if (r > 25) r = 25;
+        if (c < 1) c = 1; if (c > 80) c = 80;
+        if (r == 1) cursor_pos = 80 + (c - 1);
+        else cursor_pos = (r - 1) * 80 + (c - 1);
+        ansi_clamp_cursor();
+        break;
+    }
+    case 'J': {
+        if (p0 == 2 || p0 == 3) ansi_clear_region(80, 80 * 25);
+        else if (p0 == 1) ansi_clear_region(80, cursor_pos + 1);
+        else ansi_clear_region(cursor_pos, 80 * 25);
+        break;
+    }
+    case 'K': {
+        int line = (cursor_pos / 80) * 80;
+        if (p0 == 2) ansi_clear_region(line, line + 80);
+        else if (p0 == 1) ansi_clear_region(line, cursor_pos + 1);
+        else ansi_clear_region(cursor_pos, line + 80);
+        break;
+    }
+    case 'm': {
+        if (ansi_nparams == 0) { ansi_fg = ansi_bg = 0xFF; break; }
+        for (int i = 0; i < ansi_nparams; i++) {
+            int p = ansi_params[i];
+            if (p == 0) { ansi_fg = ansi_bg = 0xFF; }
+            else if (p == 1) {
+                if (ansi_fg != 0xFF && ansi_fg < 8) ansi_fg = (uint8_t)(ansi_fg + 8);
+            }
+            else if (p >= 30 && p <= 37) {
+                static const uint8_t map[8] = {
+                    VGA_COLOR_BLACK, VGA_COLOR_RED, VGA_COLOR_GREEN, VGA_COLOR_BROWN,
+                    VGA_COLOR_BLUE, VGA_COLOR_MAGENTA, VGA_COLOR_CYAN, VGA_COLOR_LIGHT_GREY
+                };
+                ansi_fg = map[p - 30];
+            }
+            else if (p >= 40 && p <= 47) {
+                static const uint8_t map[8] = {
+                    VGA_COLOR_BLACK, VGA_COLOR_RED, VGA_COLOR_GREEN, VGA_COLOR_BROWN,
+                    VGA_COLOR_BLUE, VGA_COLOR_MAGENTA, VGA_COLOR_CYAN, VGA_COLOR_LIGHT_GREY
+                };
+                ansi_bg = map[p - 40];
+            }
+            else if (p >= 90 && p <= 97) {
+                static const uint8_t map[8] = {
+                    VGA_COLOR_DARK_GREY, VGA_COLOR_LIGHT_RED, VGA_COLOR_LIGHT_GREEN, VGA_COLOR_LIGHT_BROWN,
+                    VGA_COLOR_LIGHT_BLUE, VGA_COLOR_LIGHT_MAGENTA, VGA_COLOR_LIGHT_CYAN, VGA_COLOR_WHITE
+                };
+                ansi_fg = map[p - 90];
+            }
+            else if (p == 39) ansi_fg = 0xFF;
+            else if (p == 49) ansi_bg = 0xFF;
+        }
+        break;
+    }
+    case 's': ansi_save_pos = cursor_pos; break;
+    case 'u': cursor_pos = ansi_save_pos; ansi_clamp_cursor(); break;
+    case 'h': case 'l':
+        break;
+    default:
+        break;
+    }
+}
+
+static bool ansi_feed(char c) {
+    if (ansi_state == 0) {
+        if ((uint8_t)c == 0x1B) { ansi_state = 1; return true; }
+        return false;
+    }
+    if (ansi_state == 1) {
+        if (c == '[') {
+            ansi_state = 2;
+            ansi_nparams = 0;
+            ansi_in_num = 0;
+            for (int i = 0; i < 8; i++) ansi_params[i] = 0;
+            return true;
+        }
+        if (c == '7') { ansi_save_pos = cursor_pos; ansi_state = 0; return true; }
+        if (c == '8') { cursor_pos = ansi_save_pos; ansi_clamp_cursor(); ansi_state = 0; return true; }
+        ansi_state = 0;
+        return true;
+    }
+    if (c >= '0' && c <= '9') {
+        ansi_in_num = 1;
+        if (ansi_nparams < 8)
+            ansi_params[ansi_nparams] = ansi_params[ansi_nparams] * 10 + (c - '0');
+        return true;
+    }
+    if (c == ';') {
+        if (ansi_nparams < 7) ansi_nparams++;
+        ansi_in_num = 0;
+        if (ansi_nparams < 8) ansi_params[ansi_nparams] = 0;
+        return true;
+    }
+    if (c == '?') return true;
+    if (ansi_in_num) { if (ansi_nparams < 8) ansi_nparams++; ansi_in_num = 0; }
+    ansi_exec_csi(c);
+    ansi_state = 0;
+    return true;
+}
+
 void print_char(char c) {
     // Если активен редирект — пишем в буфер, не на экран
     if (redirect_active) {
@@ -185,16 +347,29 @@ void print_char(char c) {
         return;
     }
 
-    uint8_t attr = get_theme_color();
+    if (ansi_feed(c)) {
+        update_vga_cursor(cursor_pos % 80, cursor_pos / 80);
+        return;
+    }
+
+    uint8_t attr = ansi_attr();
     uint16_t blank = (attr << 8) | ' ';
 
-    if(c == '\n'){
+    if (c == '\n') {
         int row = cursor_pos / 80;
         cursor_pos = (row + 1) * 80;
     } else if (c == '\r') {
-        // ignore
+        cursor_pos = (cursor_pos / 80) * 80;
+    } else if (c == '\t') {
+        int col = cursor_pos % 80;
+        int next = (col + 8) & ~7;
+        if (next > 80) next = 80;
+        while ((cursor_pos % 80) < next)
+            video_memory[cursor_pos++] = (attr << 8) | ' ';
+    } else if (c == '\b') {
+        if ((cursor_pos % 80) > 0) cursor_pos--;
     } else {
-        video_memory[cursor_pos++] = (attr << 8) | c;
+        video_memory[cursor_pos++] = (attr << 8) | (uint8_t)c;
     }
     
     // ✅ ПРАВИЛЬНАЯ ПРОКРУТКА с учетом цвета

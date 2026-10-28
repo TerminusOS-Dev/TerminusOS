@@ -291,12 +291,14 @@ if $BUILD_ISO; then
 
     echo -e "${BLUE}📀 Building ISO (no-emulation boot)${RESET}"
     xorriso -as mkisofs \
-        -R -J \
-        -b boot/disk.img \
-        -no-emul-boot \
-        -boot-load-size $DISK_SECTS \
-        -o $ISO_FILE \
-        $ISO_DIR 2>/dev/null
+    -R -J \
+    -isohybrid-mbr "$STAGE1_BIN" \
+    -b boot/disk.img \
+    -no-emul-boot \
+    -boot-load-size $DISK_SECTS \
+    -partition_offset 16 \
+    -o $ISO_FILE \
+    $ISO_DIR 2>/dev/null
 
     STAGE3_END=$(date +%s)
     STAGE3_TIME=$((STAGE3_END - STAGE3_START))
@@ -319,7 +321,7 @@ KERNEL_SIZE=$(du -h $KERNEL_ELF | cut -f1)
 
 rm -rf $BUILD_DIR
 rm -rf $ISO_DIR
-rm -f $STAGE1_BIN $STAGE2_BIN
+
 rm -f $OBJ_LIST
 rm -f $KERNEL_ELF
 echo -e "${RED}🗑️  Build artifacts cleaned up.${RESET}"

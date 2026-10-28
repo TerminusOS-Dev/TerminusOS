@@ -42,6 +42,13 @@ struct registers {
 
 extern idt_entry idt[256];
 
+// PIT frequency used by timer_init() (Hz). Keep in sync with syscall time math.
+#define TIMER_HZ 100
+
+// Monotonic tick counter, incremented on every PIT IRQ0.
+// uint32_t is enough: at TIMER_HZ=100 wraps in ~497 days.
+extern volatile uint32_t g_ticks;
+
 extern "C" {
     void init_idt();
     void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags);
@@ -50,6 +57,13 @@ extern "C" {
 
     void irq_set_mask(uint8_t irq_line);
     void irq_clear_mask(uint8_t irq_line);
+
+    // Program PIT channel 0 for TIMER_HZ and start counting g_ticks.
+    // Call once after init_idt() (sti already done).
+    void timer_init(void);
+
+    // Snapshot of g_ticks.
+    uint32_t timer_get_ticks(void);
 }
 
 #endif // INTERRUPTS_H

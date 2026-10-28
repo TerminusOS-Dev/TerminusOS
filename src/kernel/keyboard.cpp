@@ -19,6 +19,7 @@
 bool shift_pressed = false;
 bool caps_lock     = false;
 static bool ctrl_pressed = false;
+static bool win_pressed  = false;  // левая клавиша Win (E0 5B / E0 DB)
 // E0-префикс расширенных клавиш (стрелки, Del, Home и т.д.)
 // Нужен чтобы не спутать "фиктивный" shift (E0+0x2A / E0+0xAA) с настоящим
 static bool e0_prefix = false;
@@ -48,23 +49,109 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-uint8_t get_key() {
-    uint8_t status = inb(KEYBOARD_STATUS_PORT);
+/* Ring buffer — IRQ and poll both feed/drain it */
+#define KBD_Q_SIZE 32
+static uint8_t kbd_q[KBD_Q_SIZE];
+static volatile uint8_t kbd_q_head = 0; /* write */
+static volatile uint8_t kbd_q_tail = 0; /* read */
 
-    if (status & 0x01) {
-        serial_write("[KBD] st=");
-        serial_hex8(status);
+static void kbd_q_push(uint8_t k) {
+    if (k == 0) return;
+    uint8_t next = (uint8_t)((kbd_q_head + 1) % KBD_Q_SIZE);
+    if (next == kbd_q_tail) return; /* full — drop */
+    kbd_q[kbd_q_head] = k;
+    kbd_q_head = next;
+}
 
-        // Бит 5 = 1 означает данные от мыши — их вычитывает IRQ12/mouse_handle_packet,
-        // здесь просто пропускаем (НЕ читая порт данных, иначе уведём байт у мыши)
-        if (status & 0x20) {
-            serial_write(" mouse-skip\n");
-            return 0;
-        }
+static uint8_t kbd_q_pop(void) {
+    if (kbd_q_tail == kbd_q_head) return 0;
+    uint8_t k = kbd_q[kbd_q_tail];
+    kbd_q_tail = (uint8_t)((kbd_q_tail + 1) % KBD_Q_SIZE);
+    return k;
+}
+
+void keyboard_inject(uint8_t k) { kbd_q_push(k); }
+
+bool keyboard_has_input(void) {
+    return kbd_q_tail != kbd_q_head;
+}
+
+/* Pressed-key bitmap (set/clear by make/break scancodes) */
+static uint8_t key_down[128];
+
+uint32_t keyboard_get_state(void) {
+    /* bits: 0=W 1=S 2=A 3=D 4=Q 5=E 6=Left 7=Right 8=Up 9=Down 10=X 11=Esc */
+    uint32_t s = 0;
+    if (key_down[0x11]) s |= (1u << 0);  /* W */
+    if (key_down[0x1F]) s |= (1u << 1);  /* S */
+    if (key_down[0x1E]) s |= (1u << 2);  /* A */
+    if (key_down[0x20]) s |= (1u << 3);  /* D */
+    if (key_down[0x10]) s |= (1u << 4);  /* Q */
+    if (key_down[0x12]) s |= (1u << 5);  /* E */
+    if (key_down[0x4B]) s |= (1u << 6);  /* Left  */
+    if (key_down[0x4D]) s |= (1u << 7);  /* Right */
+    if (key_down[0x48]) s |= (1u << 8);  /* Up    */
+    if (key_down[0x50]) s |= (1u << 9);  /* Down  */
+    if (key_down[0x2D]) s |= (1u << 10); /* X */
+    if (key_down[0x01]) s |= (1u << 11); /* Esc */
+    return s;
+}
+
+
+/* Read one scancode from hardware and translate → push to queue. Returns char or 0. */
+
+/* Process one scancode (make/break). Returns translated char or 0. */
+static uint8_t kbd_process_scancode(uint8_t scancode);
+
+/* Called from IRQ1 — MUST read the data port to EOI the controller. */
+void keyboard_on_irq(void) {
+    /* Drain ALL pending keyboard bytes. Leaving data in the PS/2 buffer
+       keeps IRQ1 asserted → interrupt storm / freeze. */
+    for (int n = 0; n < 16; n++) {
+        uint8_t status = inb(KEYBOARD_STATUS_PORT);
+        if (!(status & 0x01)) break;
+        if (status & 0x20) break; /* mouse — IRQ12 owns it */
         uint8_t scancode = inb(KEYBOARD_DATA_PORT);
-        serial_write(" sc=");
-        serial_hex8(scancode);
-        serial_write("\n");
+        uint8_t ch = kbd_process_scancode(scancode);
+        if (ch) kbd_q_push(ch);
+    }
+}
+
+uint8_t get_key() {
+    /* Prefer queued keys from IRQ */
+    uint8_t k = kbd_q_pop();
+    if (k) return k;
+
+    /* Polling fallback (no IRQ / early boot). Read STATUS+DATA under CLI so
+       the pending IRQ1 can't grab the scancode between the two reads and
+       deliver the same keypress a second time. */
+    __asm__ volatile("cli");
+    uint8_t status = inb(KEYBOARD_STATUS_PORT);
+    if (!(status & 0x01) || (status & 0x20)) {
+        __asm__ volatile("sti");
+        return 0;
+    }
+    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+    __asm__ volatile("sti");
+    return kbd_process_scancode(scancode);
+}
+
+/* Pop the first queued key only if it is CHAR_CTRL_C — used by IRQ1 to hard-
+   kill a running ELF without reading the PS/2 data port from IRQ context.
+   Returns the key if it was Ctrl+C (and pops it), 0 otherwise (key left as is). */
+uint8_t keyboard_check_ctrl_c(void) {
+    if (kbd_q_tail != kbd_q_head) {
+        uint8_t k = kbd_q[kbd_q_tail];
+        if (k == CHAR_CTRL_C) {
+            kbd_q_tail = (uint8_t)((kbd_q_tail + 1) % KBD_Q_SIZE);
+            return k;
+        }
+    }
+    return 0;
+}
+
+static uint8_t kbd_process_scancode(uint8_t scancode) {
+    {
 
         // ── E0-префикс: расширенные клавиши (стрелки, Del, Home …) ──────────
         // Запоминаем, что следующий байт идёт с E0-префиксом.
@@ -73,6 +160,11 @@ uint8_t get_key() {
         // ── Ctrl ─────────────────────────────────────────────────────────────
         if (scancode == SCAN_LCTRL_PRESS)   { ctrl_pressed = true;  e0_prefix = false; return 0; }
         if (scancode == SCAN_LCTRL_RELEASE) { ctrl_pressed = false; e0_prefix = false; return 0; }
+
+        // ── Win (левая) ──────────────────────────────────────────────────────
+        // Приходит только с E0-префиксом (расширенная клавиша).
+        if (scancode == 0x5B) { win_pressed = true;  e0_prefix = false; return 0; }
+        if (scancode == 0xDB) { win_pressed = false; e0_prefix = false; return 0; }
 
         // ── Shift ─────────────────────────────────────────────────────────────
         // E0+0x2A и E0+0xAA — «фиктивный» shift, который клавиатура посылает
@@ -99,11 +191,16 @@ uint8_t get_key() {
 
         // ── Отпускание любой клавиши (бит 7) ─────────────────────────────────
         if (scancode & 0x80) {
+            key_down[scancode & 0x7F] = 0;
             e0_prefix = false;
             return 0;
         }
 
+        /* mark pressed (make code) */
+        key_down[scancode & 0x7F] = 1;
+
         // ── Ctrl+буква ────────────────────────────────────────────────────────
+        if (win_pressed && scancode == 0x2F) { e0_prefix = false; return CHAR_WIN_V; }
         if (ctrl_pressed) {
             e0_prefix = false;
             if (scancode == 0x21) return CHAR_CTRL_F;
@@ -116,6 +213,7 @@ uint8_t get_key() {
             if (scancode == 0x2D) return shift_pressed ? CHAR_CTRL_SHIFT_X : CHAR_CTRL_X;
             if (scancode == 0x0E) return CHAR_CTRL_BACKSPACE;
             if (scancode == 0x23) return CHAR_CTRL_H;
+            if (scancode == 0x1C) return CHAR_CTRL_ENTER;
         }
 
         // ── ESC ───────────────────────────────────────────────────────────────

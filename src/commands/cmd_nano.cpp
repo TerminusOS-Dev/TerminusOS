@@ -4,6 +4,11 @@
 #include "../drivers/fat32.h"
 #include "../drivers/disk.h"
 #include "../lib/string.h"
+#include "../lib/clipboard.h"
+
+// Окно истории буфера обмена (Win+V) живёт в shell.cpp. shell.h тут не подключаем:
+// он объявляет extern last_cursor_x/y, а у nano одноимённые static-переменные.
+int shell_clipboard_pick();
 
 #define EDITOR_MAX_LINES    1024
 #define EDITOR_LINE_WIDTH   256
@@ -585,16 +590,18 @@ static void editor_copy() {
             clipboard[clipboard_len++]='\n';
     }
     clipboard[clipboard_len]=0;
+    clipboard_push(clipboard);   // + в общую историю (её видят шелл и gite)
     sel_active=false;
     editor_redraw();
 }
 
-// Ctrl+V — вставить clipboard в текущую позицию
-static void editor_paste() {
-    if(clipboard_len==0) return;
+// Вставка произвольного текста в текущую позицию (Ctrl+V и Win+V)
+static void editor_paste_text(const char* txt, int n) {
+    if(n<=0) return;
     undo_save();
-    for(int ci=0; ci<clipboard_len; ci++){
-        char c=clipboard[ci];
+    sel_active=false;
+    for(int ci=0; ci<n; ci++){
+        char c=txt[ci];
         if(c=='\n'){
             editor_new_line();
         } else {
@@ -613,6 +620,21 @@ static void editor_paste() {
     editor_redraw();
 }
 
+// Ctrl+V — вставить clipboard в текущую позицию.
+// Если в этом сеансе nano ещё ничего не копировали — берём самую свежую запись
+// общей истории (то, что скопировали в шелле или gite).
+static void editor_paste() {
+    if(clipboard_len==0 && clipboard_count()>0){
+        const char* s=clipboard_get(0);
+        while(s[clipboard_len] && clipboard_len<CLIPBOARD_SIZE-2){
+            clipboard[clipboard_len]=s[clipboard_len];
+            clipboard_len++;
+        }
+        clipboard[clipboard_len]=0;
+    }
+    editor_paste_text(clipboard, clipboard_len);
+}
+
 // Ctrl+A — выделить весь текст
 static void editor_select_all() {
     sel_active=true;
@@ -628,6 +650,7 @@ static void editor_copy_line() {
     for(int i=0;i<len && clipboard_len<CLIPBOARD_SIZE-2;i++) clipboard[clipboard_len++]=editor_buffer[current_line][i];
     clipboard[clipboard_len++]='\n';
     clipboard[clipboard_len]=0;
+    clipboard_push(clipboard);
 }
 
 // Ctrl+Shift+A — вырезать текущую строку целиком в clipboard
@@ -638,6 +661,7 @@ static void editor_cut_line() {
     for(int i=0;i<len && clipboard_len<CLIPBOARD_SIZE-2;i++) clipboard[clipboard_len++]=editor_buffer[current_line][i];
     clipboard[clipboard_len++]='\n';
     clipboard[clipboard_len]=0;
+    clipboard_push(clipboard);
 
     if(total_lines>1){
         for(int i=current_line;i<total_lines-1;i++) strcpy(editor_buffer[i],editor_buffer[i+1]);
@@ -695,6 +719,7 @@ static void editor_cut() {
             clipboard[clipboard_len++]='\n';
     }
     clipboard[clipboard_len]=0;
+    clipboard_push(clipboard);
 
     editor_delete_selection();
 }
@@ -873,6 +898,7 @@ static void editor_show_help() {
         "   Ctrl+Z / Ctrl+Y         Undo / Redo",
         "   Ctrl+C / Ctrl+X / Ctrl+V  Copy / Cut selection / Paste",
         "   Ctrl+K / Ctrl+Shift+A   Copy / Cut current line",
+        "   Win+V                   Clipboard history (shared with shell)",
         " Selection & navigation",
         "   Shift+arrows            Select",
         "   Ctrl+Shift+Left/Right   Select by word",
@@ -881,8 +907,7 @@ static void editor_show_help() {
         "   Ctrl+F                  Search",
         "   Ctrl+Shift+X            Go to line[:column]",
         " Autocomplete",
-        "   Tab                     Complete word / insert indent",
-        "   Tab (again)             Next completion match",
+        "   Tab                     Complete word / next match / indent",
         "   Ctrl+H                  This help screen",
         "        Press any key to close...",
     };
@@ -1031,6 +1056,12 @@ void cmd_nano(char* filename) {
         if(c==CHAR_CTRL_V)     { editor_paste();          continue; }
         if(c==CHAR_CTRL_K)     { editor_copy_line();      continue; }
         if(c==CHAR_CTRL_X)     { editor_cut();            continue; }
+        if(c==CHAR_WIN_V) {                                // Win+V — история буфера обмена
+            int idx=shell_clipboard_pick();
+            if(idx>=0){ const char* t=clipboard_get(idx); editor_paste_text(t,(int)strlen(t)); }
+            else editor_redraw();
+            continue;
+        }
         if(c==CHAR_CTRL_SHIFT_A){ editor_cut_line();      continue; }
         if(c==CHAR_CTRL_SHIFT_X){ editor_goto_dialog();   continue; }
         if(c==CHAR_CTRL_A)     { editor_select_all();     continue; }

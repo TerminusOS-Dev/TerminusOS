@@ -30,7 +30,7 @@ static int  s_clip_x1 = 0, s_clip_y1 = 0;
 static int  s_clip_x2 = 0, s_clip_y2 = 0;
 static bool s_clip_active = false;
 
-static const uint32_t vga_palette_32[16] = {
+static uint32_t vga_palette_32[256] = {
     0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
     0x00AA0000, 0x00AA00AA, 0x00AA5500, 0x00AAAAAA,
     0x00555555, 0x005555FF, 0x0055FF55, 0x0055FFFF,
@@ -858,11 +858,18 @@ void gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
     outb(0x3C9, r);
     outb(0x3C9, g);
     outb(0x3C9, b);
+    // LFB-рендер (gfx_flip) берёт цвет НЕ из DAC, а из vga_palette_32,
+    // поэтому без этой синхронизации любое переназначение палитры невидимо.
+    uint8_t r8 = (uint8_t)((r << 2) | (r >> 4));
+    uint8_t g8 = (uint8_t)((g << 2) | (g >> 4));
+    uint8_t b8 = (uint8_t)((b << 2) | (b >> 4));
+    vga_palette_32[idx] = ((uint32_t)r8 << 16) | ((uint32_t)g8 << 8) | (uint32_t)b8;
 }
 
 void gfx_init_palette() {
-    // Стандартные 16 цветов VGA (значения 0-63 для DAC)
-    static const uint8_t pal[16][3] = {
+    // Полная 256-цветная палитра (значения 0-63 для DAC)
+    // 0-15: стандартные VGA
+    static const uint8_t std16[16][3] = {
         {  0,  0,  0 }, // 0  Black
         {  0,  0, 42 }, // 1  Blue
         {  0, 42,  0 }, // 2  Green
@@ -880,8 +887,31 @@ void gfx_init_palette() {
         { 63, 63, 21 }, // 14 Yellow
         { 63, 63, 63 }, // 15 White
     };
+    for (int i = 0; i < 16; i++)
+        gfx_set_palette((uint8_t)i, std16[i][0], std16[i][1], std16[i][2]);
+
+    // 16-31: градации серого
     for (int i = 0; i < 16; i++) {
-        gfx_set_palette(i, pal[i][0], pal[i][1], pal[i][2]);
+        uint8_t v = (uint8_t)(i * 4); // 0..60
+        gfx_set_palette((uint8_t)(16 + i), v, v, v);
+    }
+
+    // 32-247: куб 6×6×6 RGB (216 цветов) — типичная VGA 256-color раскладка
+    static const uint8_t levels[6] = { 0, 12, 25, 38, 51, 63 };
+    int idx = 32;
+    for (int r = 0; r < 6; r++)
+        for (int g = 0; g < 6; g++)
+            for (int b = 0; b < 6; b++) {
+                gfx_set_palette((uint8_t)idx,
+                                levels[r], levels[g], levels[b]);
+                idx++;
+            }
+
+    // 248-255: дополнительные оттенки серого
+    for (int i = 0; i < 8; i++) {
+        uint8_t v = (uint8_t)(7 + i * 8);
+        if (v > 63) v = 63;
+        gfx_set_palette((uint8_t)(248 + i), v, v, v);
     }
 }
 
@@ -1015,10 +1045,10 @@ static void cursor_blit_vram(int x, int y) {
             if (px < 0 || px >= gfx_width || py < 0 || py >= gfx_height) continue;
             if (lfb_ready && lfb_bpp == 32) {
                 ((uint32_t*)lfb_addr)[(uint32_t)py*(lfb_pitch/4)+(uint32_t)px]
-                    = vga_palette_32[color & 0x0F];
+                    = vga_palette_32[color];
             } else if (lfb_ready && lfb_bpp == 24) {
                 uint8_t* fb  = (uint8_t*)lfb_addr;
-                uint32_t c   = vga_palette_32[color & 0x0F];
+                uint32_t c   = vga_palette_32[color];
                 uint32_t off = (uint32_t)py * lfb_pitch + (uint32_t)px * 3;
                 fb[off+0] = (uint8_t)(c & 0xFF);
                 fb[off+1] = (uint8_t)((c >> 8)  & 0xFF);
@@ -1034,16 +1064,33 @@ static void cursor_blit_vram(int x, int y) {
     }
 }
 
+// Рисует курсор МЫШИ прямо в backbuffer (индексами 0/15 = чёрный/белый),
+// а не поверх VRAM. Нужно, чтобы курсор переносился в VRAM вместе со сценой
+// при gfx_flip() и НЕ мерцал: при рисовании поверх VRAM он стёрт копированием
+// бо́льшую часть кадра. Клиппинг на время рисования отключаем (иначе курсор
+// обрежется, если активен gfx_set_clip), потом восстанавливаем.
+void gfx_cursor_blit_backbuffer(int x, int y) {
+    bool clip_saved = s_clip_active;
+    s_clip_active = false;
+    for (int dy = 0; dy < GFX_CURSOR_H; dy++)
+        for (int dx = 0; dx < GFX_CURSOR_W; dx++) {
+            uint8_t t = CURSOR_ARROW[dy][dx];
+            if (t == 0) continue;
+            gfx_put_pixel(x + dx, y + dy, (t == 1) ? GFX_WHITE : GFX_BLACK);
+        }
+    s_clip_active = clip_saved;
+}
+
 // Записать один пиксель из backbuffer → VRAM (восстановление фона под курсором)
 static void vram_put_from_backbuf(int px, int py) {
     if (px < 0 || px >= gfx_width || py < 0 || py >= gfx_height) return;
     uint8_t idx = backbuffer[(uint32_t)py * (uint32_t)gfx_width + (uint32_t)px];
     if (lfb_ready && lfb_bpp == 32) {
         ((uint32_t*)lfb_addr)[(uint32_t)py*(lfb_pitch/4)+(uint32_t)px]
-            = vga_palette_32[idx & 0x0F];
+            = vga_palette_32[idx];
     } else if (lfb_ready && lfb_bpp == 24) {
         uint8_t* fb  = (uint8_t*)lfb_addr;
-        uint32_t c   = vga_palette_32[idx & 0x0F];
+        uint32_t c   = vga_palette_32[idx];
         uint32_t off = (uint32_t)py * lfb_pitch + (uint32_t)px * 3;
         fb[off+0] = (uint8_t)(c & 0xFF);
         fb[off+1] = (uint8_t)((c >> 8)  & 0xFF);
@@ -1095,7 +1142,7 @@ void gfx_flip() {
                 uint32_t*       dst = fb + (uint32_t)y * stride;
                 const uint8_t*  src = backbuffer + (uint32_t)y * (uint32_t)gfx_width;
                 for (int x = 0; x < gfx_width; x++)
-                    dst[x] = vga_palette_32[src[x] & 0x0F];
+                    dst[x] = vga_palette_32[src[x]];
             }
         } else if (lfb_bpp == 24) {
             uint8_t* fb = (uint8_t*)lfb_addr;
@@ -1103,7 +1150,7 @@ void gfx_flip() {
                 uint8_t*       dst = fb + (uint32_t)y * lfb_pitch;
                 const uint8_t* src = backbuffer + (uint32_t)y * (uint32_t)gfx_width;
                 for (int x = 0; x < gfx_width; x++) {
-                    uint32_t c = vga_palette_32[src[x] & 0x0F];
+                    uint32_t c = vga_palette_32[src[x]];
                     dst[x*3+0] = (uint8_t)(c & 0xFF);
                     dst[x*3+1] = (uint8_t)((c >> 8)  & 0xFF);
                     dst[x*3+2] = (uint8_t)((c >> 16) & 0xFF);

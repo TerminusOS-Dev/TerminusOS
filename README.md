@@ -1,81 +1,129 @@
-# 🛠 TerminusOS v0.4.7 — GUI & Graphics Update
+# 🛠 TerminusOS v4.9a "Altair" — Userspace & GITE Update
 
-> Major release: a real VGA graphics mode with mouse support and a GUI widget toolkit, a custom bootloader replacing GRUB, native CD-ROM (ISO 9660) support, and a heavily overhauled Nano editor.
+> Major release: TerminusOS can now run real ELF programs through a Linux-compatible syscall ABI, gets a graphical text editor **GITE**, a BMP image viewer, a clipboard history, and a bootloader that finally works on real hardware.
 
----
-
-## 🖱 VGA Graphics Mode & GUI Widgets
-
-TerminusOS can now switch out of text mode into real VGA graphics — **640×480** (Mode X) with a working **PS/2 mouse cursor**, double-buffered rendering, and a small immediate-mode GUI toolkit: buttons, checkboxes, sliders, toggles, progress bars, text fields, scroll panels, and right-click context menus.
-
-Two commands show it off:
-
-**`gui`** — a small Paint-style drawing app. Toolbar with a 16-color palette and pen size, left-click to draw, right-click/menu to clear.
-
-```
-gui
-```
-
-![gui paint demo](images/gui_paint.png)
-
-**`widgets`** — a showcase of every widget: sliders you can drag, toggles, a scrollable text panel (mouse wheel or arrow keys), and a right-click context menu.
-
-```
-widgets
-```
-
-![widgets demo](images/widgets_demo.png)
+> ℹ️ Versioning has changed: `0.4.7` → `4.9a`. Every release now has a codename — this one is **Altair**.
 
 ---
 
-## 💿 New Bootloader & CD-ROM Support
+## 🧩 Run Real Programs — ELF Loader & Linux ABI
 
-GRUB is gone. TerminusOS now boots through its own two-stage MBR bootloader (`boot/stage1.asm` + `boot/stage2.asm`), and `build.sh` produces two artifacts from the same image:
+TerminusOS can now run programs that were **not written for it**. Static i386 ELF binaries (musl, and some glibc) are loaded into memory and talk to the kernel through the Linux i386 syscall ABI (`int 0x80`) — file I/O, memory (`brk`, `mmap`), time, TLS, `uname` and more. Even **BusyBox** runs.
 
-- **`disk.img`** — a raw bootable disk image, write it to a USB stick or virtual HDD with `dd`.
-- **`Terminus_OS.iso`** — the same `disk.img` embedded via El Torito **no-emulation** boot, so it boots identically from a CD-ROM.
-
+```Shell
+run <program.elf>
+run -d <program.elf>     # trace every syscall
 ```
+
+![running busybox](images/run_busybox.png)
+
+On top of the Linux ABI there are **Terminus extensions** (syscalls 1000+) that give userspace programs access to graphics, mouse and keyboard — double-buffered drawing, 256-color palette, direct backbuffer access, mouse position/buttons, a held-keys bitmask for games. A header with ready-made wrappers lives in `userspace/terminus_gfx.h`.
+
+Samples in `userspace/`:
+
+- **`raymarch_editor`** — ray-marching scene editor (spawn objects, motion modes, materials)
+- **`arh`** — a tiny system-info program
+
+#### raymarch_editor.elf
+![raymarch_editor.elf](images/userspace_raymarch.png)
+
+#### arh.elf
+![arh.elf](images/userspace_arh.png)
+
+Under the hood: extended GDT with TLS, a 100 Hz PIT timer, and a real heap with integrity checking. Press **Ctrl+C** to kill a running program.
+
+---
+
+## ✏️ GITE — Graphic Terminus Editor
+
+A new **graphical text editor** for 640×480 with full mouse support. The editing engine comes from Nano, everything else is new:
+
+- **Tabs** — several files open at once
+- **File panel** and a **built-in terminal**, both toggleable
+- **Undo / Redo**, selection, **Find & Replace**, **Go to line**, jump by word
+- **Open / Save / Save as / New file / New folder / Rename**
+- **Syntax highlighting** and a custom color theme
+- Shares the new **clipboard history** with the shell
+
+```Shell
+gite [file]
+```
+
+![gite editor](images/gite_main.png)
+
+---
+
+## 🖼 BMP Viewer & Paint
+
+The new **`image`** command opens BMP pictures. The old `gui` app is now called **`paint`** and can **load and save BMP files**.
+
+```Shell
+paint otval.bmp
+image otval.bmp
+```
+
+Graphics got a full **256-color palette** (16 VGA colors, 16 greys, a 6×6×6 RGB cube, 8 extra greys), and the mouse cursor is now drawn into the backbuffer, so there is less flicker.
+
+#### paint
+![paint with bmp](images/paint_bmp.png)
+
+#### image
+![image viewer](images/image_viewer.png)
+---
+
+## 📋 Clipboard History & Better Shell
+
+Press **`Win+V`** in the shell to open a **clipboard history panel** — the last 8 copied or cut entries, shared between the shell and GITE and nano, saved to disk and restored after reboot.
+
+#### in shell
+![clipboard panel shell](images/clipboard_panel_shell.png)
+
+#### in nano
+![clipboard panel nano](images/clipboard_panel_nano.png)
+
+#### in GITE
+![clipboard panel GITE](images/clipboard_panel_GITE.png)
+
+Also new in the shell:
+
+- **`Ctrl+←/→`** jump by word, **`Ctrl+Backspace`** deletes a word
+- **`Shift+←/→`** select symbol, **`Ctrl+Shift+←/→`** select word, **`Ctrl+V`** to paste **`Ctrl+C`** to copy, and **`Ctrl+X`** to cut
+- **ANSI/VT100 escape codes** are understood (cursor movement, clearing, colors) — enough for BusyBox tools
+- **`mv file /dir`** now correctly moves a file *into* a directory
+- **`meminfo`** also shows heap usage and integrity
+- **`info`** shows the version, codename and the list of updates
+
+![info command](images/info.png)
+
+---
+
+## 💾 Works on Real Hardware
+
+The bootloader was reworked after testing on an old PC:
+
+- Disk is read in **CHS mode only** — Extended LBA BIOS calls hung or rebooted some machines
+- Stage 1 prints `1` → `G` → `2` while booting, so you can see where a stubborn machine stops
+- **ATA/ATAPI timeouts are much longer** — real spinning disks are slower than QEMU
+- Fixed mouse movement loss on fast flicks, and Ctrl+C detection while a program runs
+
+---
+
+## 🧰 For Developers
+
+- **`tfsutil`** — host tool for TerminusOS disk images: `info`, `ls`, `cat`, `extract`, `format`, `add`, `mkdir`, `rm`
+- **`syscalls.md`** — syscall reference
+
+```Shell
 ./build.sh        # both ISO and disk.img
-./build.sh disk    # disk.img only
-./build.sh iso     # ISO only
+./build.sh disk   # disk.img only
+./build.sh iso    # ISO only
 ```
 
-On top of that, the kernel now speaks **ATAPI** and reads real **ISO 9660** filesystems — if a CD-ROM is present at boot, it's auto-detected and mounted as a virtual `/cdrom` folder. It shows up right in `ls` at the root, and `cd`, `ls`, `cat`, and `nano`/`edit` all work transparently inside it (read-only, as you'd expect from a CD).
-
-```
-ls              # shows "cdrom <DIR>" at the root if a disc is mounted
-cd /cdrom
-ls
-cat readme.txt
-```
-
-![cdrom mounted and browsed](images/cdrom_browse.png)
-
----
-
-## 📝 Nano Editor — Another Major Overhaul
-
-Nano got rebuilt again since 0.4.3, on every axis:
-
-- **Much bigger buffer** — 200 → **1024 lines**, line width 79 → **256 characters**, with horizontal scrolling for long lines.
-- **Basic syntax highlighting** for C/C++ and x86 assembly (auto-detected by file extension `.c/.h/.cpp/.hpp` / `.asm/.s`) — keywords, strings, comments, preprocessor directives, brackets, and numbers, each in their own color, correctly following the active theme's background.
-- **Tab autocompletion** — completes the word under the cursor from language keywords and identifiers already used in the file; press Tab again to cycle to the next match.
-- **Line & block editing** — `Ctrl+K`/`Ctrl+Shift+A` to copy/cut the current line, `Ctrl+C`/`Ctrl+X`/`Ctrl+V` for selections, `Ctrl+A` to select all.
-- **Word-wise navigation** — `Ctrl+←/→` to jump by word, `Ctrl+Shift+←/→` to select by word, `Ctrl+Backspace`/`Ctrl+Delete` to delete a whole word.
-- **Go to line\:column** — `Ctrl+Shift+X` jumps straight to a position; typing a line past the end of the file pads it with blank lines to get there, and a column past the end of a line just lands you at its end.
-- **Full-screen help** — `Ctrl+H` opens a dedicated shortcut reference screen (the old one-line status bar couldn't fit it all anymore).
-
-#### cpp
-![nano syntax highlighting](images/nano_syntax.png)
-#### asm
-![nano syntax highlighting](images/nano_syntax_1.png)
-#### Help for nano
-![nano help screen](images/nano_help.png)
+> Use `-m 128` or more RAM in QEMU — user programs live above 64 MB. (Better 256MB RAM)
 
 ---
 
 ## 👨‍💻 Author
 
-YouTube: [Zero Logic](https://www.youtube.com/@Zero-Logic-dev)
-Telegram: [@den2010991](https://t.me/den2010991)
+- **YouTube:** [Zero Logic](https://www.youtube.com/@Zero-Logic-dev)
+- **Telegram:** [@Terminus_dev](https://telegram.me/Terminus_dev)
